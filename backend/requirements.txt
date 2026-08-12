@@ -5,3 +5,4 @@ SQLAlchemy==2.0.35
 python-dotenv==1.0.1
 google-genai==0.3.0
 requests==2.32.3
+gunicorn==22.0.0
