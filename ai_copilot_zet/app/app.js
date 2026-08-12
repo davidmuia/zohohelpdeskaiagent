@@ -22,7 +22,7 @@
 // NOTE: port 5000 is used by `zet run` to serve the widget itself — the Flask
 // backend must run on a different port (5001 by default; set PORT=5001 in
 // backend/.env to match).
-const API_BASE_URL = "http://localhost:5001";
+const API_BASE_URL = "https://zohohelpdeskaiagent.onrender.com";
 const ANALYZE_ENDPOINT = `${API_BASE_URL}/api/analyze`;
 
 // ---------------------------------------------------------------------------
