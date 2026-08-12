@@ -1,0 +1,33 @@
+{
+  "extension": {
+    "name": "ai_service_desk_copilot",
+    "version": "1.0.0",
+    "displayName": "Penda IT-Helpdesk Copilot",
+    "description": "Reads the open ticket, sends it to an AI backend for analysis, and displays a structured technician assist panel. Read-only in this MVP: no ticket data is modified.",
+    "type": "widget"
+  },
+  "locale": ["en"],
+  "service": "DESK",
+  "storage": false,
+  "type": "personal",
+  "whiteListedDomains": [],
+  "modules": {
+    "widgets": [
+      {
+        "name": "ai_copilot_subtab",
+        "title": "Penda AI Copilot",
+        "location": "desk.ticket.detail.subtab",
+        "url": "/app/index.html",
+        "logo": "/app/img/logo.png",
+        "icon": "/app/img/icon.png"
+      }
+    ]
+  },
+  "cspDomains": {
+    "connect-src": ["http://localhost:5001", "http://127.0.0.1:5001"]
+  },
+  "zohoAuthorisation": {},
+  "connectors": [],
+  "config": [],
+  "moduleSupport": false
+}
