@@ -24,7 +24,7 @@
     ]
   },
   "cspDomains": {
-    "connect-src": ["https://zohohelpdeskaiagent.onrender.com"]
+    "connect-src": ["http://localhost:5001", "http://127.0.0.1:5001"]
   },
   "zohoAuthorisation": {},
   "connectors": [],
