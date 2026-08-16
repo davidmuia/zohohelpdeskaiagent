@@ -1,0 +1,811 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>KB Review Queue</title>
+<style>
+  :root {
+    --ink: #1c2128;
+    --ink-dim: #5b6472;
+    --line: #d8dce2;
+    --bg: #f6f7f9;
+    --card: #ffffff;
+    --accent: #2f6f4f;
+    --accent-dim: #e7f0ea;
+    --warn: #a34e2c;
+    --warn-dim: #f5e6de;
+    --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: var(--sans);
+    background: var(--bg);
+    color: var(--ink);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* ---------- Login screen ---------- */
+  #login-screen {
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+  }
+  #login-screen.hidden { display: none; }
+  .login-card {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 32px;
+    width: 100%;
+    max-width: 340px;
+  }
+  .login-card h1 { font-size: 16px; font-weight: 700; margin: 0 0 4px; }
+  .login-card p.sub { font-size: 13px; color: var(--ink-dim); margin: 0 0 20px; }
+  .login-card label {
+    display: block;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--ink-dim);
+    margin: 14px 0 4px;
+  }
+  .login-card input {
+    width: 100%;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 9px 10px;
+    font-size: 14px;
+    font-family: var(--sans);
+    background: #fbfbfc;
+  }
+  .login-card input:focus { outline: none; border-color: var(--accent); background: #fff; }
+  .login-card button {
+    width: 100%;
+    margin-top: 20px;
+    padding: 10px;
+    font-size: 14px;
+    font-weight: 600;
+    border-radius: 6px;
+    border: 1px solid var(--accent);
+    background: var(--accent);
+    color: #fff;
+    cursor: pointer;
+  }
+  .login-card button:hover { background: #275c41; }
+  .login-card button:disabled { opacity: 0.6; cursor: default; }
+  #login-error {
+    font-size: 12.5px;
+    color: var(--warn);
+    margin-top: 12px;
+    display: none;
+  }
+
+  /* ---------- Main app ---------- */
+  #app.hidden { display: none; }
+  header {
+    padding: 16px 28px;
+    border-bottom: 1px solid var(--line);
+    background: var(--card);
+    position: sticky;
+    top: 0;
+    z-index: 5;
+  }
+  header .top-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+  header h1 { font-size: 16px; font-weight: 700; margin: 0; letter-spacing: 0.01em; }
+  .user-badge {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 12.5px;
+    color: var(--ink-dim);
+  }
+  .user-badge strong { color: var(--ink); }
+  .user-badge button {
+    font-size: 12px;
+    font-weight: 600;
+    padding: 5px 10px;
+    border-radius: 6px;
+    border: 1px solid var(--line);
+    background: #fff;
+    color: var(--ink-dim);
+    cursor: pointer;
+  }
+  .user-badge button:hover { background: #f0f1f3; }
+  .tabs { display: flex; gap: 4px; margin-top: 14px; align-items: center; flex-wrap: wrap; }
+  .tab {
+    font-size: 13px;
+    font-weight: 600;
+    padding: 7px 14px;
+    border-radius: 100px;
+    border: 1px solid var(--line);
+    background: #fff;
+    color: var(--ink-dim);
+    cursor: pointer;
+  }
+  .tab.active { background: var(--ink); color: #fff; border-color: var(--ink); }
+  .new-btn {
+    font-size: 13px;
+    font-weight: 600;
+    padding: 7px 14px;
+    border-radius: 100px;
+    border: 1px solid var(--accent);
+    background: var(--accent-dim);
+    color: var(--accent);
+    cursor: pointer;
+    margin-left: auto;
+  }
+  #search-box {
+    margin-top: 10px;
+    display: flex;
+    gap: 8px;
+  }
+  #search-box input {
+    flex: 1;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 7px 10px;
+    font-size: 13px;
+    background: #fbfbfc;
+  }
+  #search-box input:focus { outline: none; border-color: var(--accent); background: #fff; }
+
+  main {
+    max-width: 880px;
+    margin: 0 auto;
+    padding: 24px 20px 40px;
+  }
+  #empty {
+    text-align: center;
+    color: var(--ink-dim);
+    padding: 80px 20px;
+    font-size: 14px;
+  }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    margin-bottom: 16px;
+    overflow: hidden;
+  }
+  .card.is-new { border-color: var(--accent); }
+  .card-head {
+    padding: 14px 18px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    border-bottom: 1px solid var(--line);
+  }
+  .card-head input[type=text] {
+    flex: 1;
+    font-size: 15px;
+    font-weight: 700;
+    border: none;
+    background: transparent;
+    color: var(--ink);
+    padding: 4px 0;
+  }
+  .card-head input[type=text]:focus { outline: none; border-bottom: 1px solid var(--accent); }
+  .badge {
+    font-family: var(--mono);
+    font-size: 11px;
+    padding: 3px 8px;
+    border-radius: 100px;
+    background: var(--accent-dim);
+    color: var(--accent);
+    white-space: nowrap;
+  }
+  .badge.count-1 { background: var(--warn-dim); color: var(--warn); }
+  .badge.status-approved { background: var(--accent-dim); color: var(--accent); }
+  .badge.status-rejected { background: var(--warn-dim); color: var(--warn); }
+  .badge.status-pending_review { background: #eef1f5; color: var(--ink-dim); }
+  .card-body { padding: 4px 18px 14px; }
+  .field { margin: 12px 0; }
+  .field label {
+    display: block;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--ink-dim);
+    margin-bottom: 4px;
+  }
+  .field textarea, .field input[type=text].plain {
+    width: 100%;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-size: 13.5px;
+    font-family: var(--sans);
+    color: var(--ink);
+    resize: vertical;
+    background: #fbfbfc;
+  }
+  .field textarea:focus, .field input:focus { outline: none; border-color: var(--accent); background: #fff; }
+  .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .meta-line {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--ink-dim);
+    padding: 0 18px 12px;
+  }
+  .actions {
+    padding: 12px 18px;
+    border-top: 1px solid var(--line);
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+    flex-wrap: wrap;
+    background: #fafbfc;
+  }
+  button {
+    font-family: var(--sans);
+    font-size: 13px;
+    font-weight: 600;
+    padding: 8px 16px;
+    border-radius: 6px;
+    border: 1px solid var(--line);
+    background: #fff;
+    color: var(--ink);
+    cursor: pointer;
+  }
+  button:hover { background: #f0f1f3; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.primary:hover { background: #275c41; }
+  button.reject { color: var(--warn); }
+  button.danger { color: var(--warn); }
+  button:disabled { opacity: 0.5; cursor: default; }
+
+  #pagination {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    margin-top: 8px;
+    font-size: 13px;
+    color: var(--ink-dim);
+  }
+  #pagination button {
+    padding: 6px 12px;
+  }
+
+  #toast {
+    position: fixed;
+    bottom: 24px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: var(--ink);
+    color: #fff;
+    font-size: 13px;
+    padding: 10px 18px;
+    border-radius: 8px;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.2s;
+    z-index: 20;
+  }
+  #toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+
+<div id="login-screen">
+  <div class="login-card">
+    <h1>KB Review Queue</h1>
+    <p class="sub">Sign in to review, edit, and manage Knowledge Base articles.</p>
+    <form id="login-form">
+      <label for="login-username">Username</label>
+      <input type="text" id="login-username" autocomplete="username" required />
+      <label for="login-password">Password</label>
+      <input type="password" id="login-password" autocomplete="current-password" required />
+      <button type="submit" id="login-submit">Sign in</button>
+      <p id="login-error"></p>
+    </form>
+  </div>
+</div>
+
+<div id="app" class="hidden">
+  <header>
+    <div class="top-row">
+      <h1>KB Review Queue</h1>
+      <div class="user-badge">
+        <span>Signed in as <strong id="current-user"></strong></span>
+        <button id="logout-btn">Log out</button>
+      </div>
+    </div>
+    <div class="tabs">
+      <button class="tab active" data-status="pending_review">Pending</button>
+      <button class="tab" data-status="approved">Approved</button>
+      <button class="tab" data-status="rejected">Rejected</button>
+      <button class="new-btn" id="new-article-btn">+ New article</button>
+    </div>
+    <div id="search-box">
+      <input type="text" id="search-input" placeholder="Search title, symptoms, cause, resolution…" />
+    </div>
+  </header>
+  <main>
+    <div id="list"></div>
+    <div id="empty" style="display:none;"></div>
+    <div id="pagination" style="display:none;"></div>
+  </main>
+</div>
+
+<div id="toast"></div>
+
+<script>
+const API = "";
+let currentTab = "pending_review";
+let currentUser = null;
+let currentPage = 1;
+const PAGE_SIZE = 20;
+let searchDebounce = null;
+let idleWarnTimer = null;
+let idleLogoutTimer = null;
+let idleTimeoutMinutes = 20; // overwritten from server on login/session-check
+
+// ---------------------------------------------------------------------
+// Auth: login / logout / session check / idle timeout
+// ---------------------------------------------------------------------
+
+function showLogin(message) {
+  document.getElementById("login-screen").classList.remove("hidden");
+  document.getElementById("app").classList.add("hidden");
+  clearIdleTimers();
+  const err = document.getElementById("login-error");
+  if (message) {
+    err.textContent = message;
+    err.style.display = "block";
+  } else {
+    err.style.display = "none";
+  }
+}
+
+function showApp(user, idleMinutes) {
+  currentUser = user;
+  idleTimeoutMinutes = idleMinutes || idleTimeoutMinutes;
+  document.getElementById("current-user").textContent = user;
+  document.getElementById("login-screen").classList.add("hidden");
+  document.getElementById("app").classList.remove("hidden");
+  armIdleTimers();
+  loadList();
+}
+
+document.getElementById("login-form").addEventListener("submit", async (evt) => {
+  evt.preventDefault();
+  const username = document.getElementById("login-username").value.trim();
+  const password = document.getElementById("login-password").value;
+  const submitBtn = document.getElementById("login-submit");
+  submitBtn.disabled = true;
+
+  try {
+    const res = await fetch(`${API}/admin/kb/login`, {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username, password }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      showLogin(data.error || "Sign in failed.");
+      return;
+    }
+    document.getElementById("login-password").value = "";
+    showApp(data.user, data.idle_timeout_minutes);
+  } catch (err) {
+    showLogin("Could not reach the server. Try again.");
+  } finally {
+    submitBtn.disabled = false;
+  }
+});
+
+document.getElementById("logout-btn").addEventListener("click", () => doLogout());
+
+async function doLogout(message) {
+  try {
+    await fetch(`${API}/admin/kb/logout`, { method: "POST", credentials: "include" });
+  } catch (err) {
+    // best-effort — show the login screen regardless of network state
+  }
+  showLogin(message);
+}
+
+// Idle auto-logout: client-side warning + logout, mirroring the server's
+// own sliding idle window (see app.py _validate_kb_session). The server
+// is the real enforcement point (any API call after server-side expiry
+// gets a 401, handled in authedFetch below) — this client timer exists
+// so an idle reviewer sees a clean "signed out" screen proactively,
+// rather than only discovering it on their next click.
+function armIdleTimers() {
+  clearIdleTimers();
+  const warnAtMs = Math.max(0, (idleTimeoutMinutes - 1)) * 60 * 1000;
+  const logoutAtMs = idleTimeoutMinutes * 60 * 1000;
+  idleWarnTimer = setTimeout(() => {
+    toast("You'll be signed out soon due to inactivity.");
+  }, warnAtMs);
+  idleLogoutTimer = setTimeout(() => {
+    doLogout("Signed out due to inactivity.");
+  }, logoutAtMs);
+}
+
+function clearIdleTimers() {
+  if (idleWarnTimer) clearTimeout(idleWarnTimer);
+  if (idleLogoutTimer) clearTimeout(idleLogoutTimer);
+}
+
+["mousemove", "mousedown", "keydown", "scroll", "touchstart"].forEach((evt) => {
+  document.addEventListener(evt, () => {
+    if (!document.getElementById("app").classList.contains("hidden")) {
+      armIdleTimers();
+    }
+  }, { passive: true });
+});
+
+// All authenticated calls funnel through here so a server-side session
+// expiry (idle timeout hit between activity events, or the hard
+// session-lifetime ceiling) is caught uniformly and shows the login
+// screen immediately, rather than each call site handling 401 separately.
+async function authedFetch(url, options) {
+  const res = await fetch(url, { credentials: "include", ...options });
+  if (res.status === 401) {
+    showLogin("Your session has expired. Please sign in again.");
+    throw new Error("session-expired");
+  }
+  return res;
+}
+
+// On page load: ask the server if we're already validly logged in
+// (a real page reload, not just re-opening the collapsible) before
+// deciding whether to show the login screen.
+(async function init() {
+  try {
+    const res = await fetch(`${API}/admin/kb/session`, { credentials: "include" });
+    if (res.ok) {
+      const data = await res.json();
+      showApp(data.user, data.idle_timeout_minutes);
+      return;
+    }
+  } catch (err) {
+    // fall through to login screen
+  }
+  showLogin();
+})();
+
+// ---------------------------------------------------------------------
+// Toast
+// ---------------------------------------------------------------------
+
+function toast(msg) {
+  const el = document.getElementById("toast");
+  el.textContent = msg;
+  el.classList.add("show");
+  setTimeout(() => el.classList.remove("show"), 2200);
+}
+
+function esc(s) {
+  return (s || "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+}
+
+function emptyMessage(status) {
+  if (status === "pending_review") return "Nothing waiting on review. New drafts appear here after the next scan.";
+  if (status === "approved") return "No approved articles yet.";
+  return "No rejected articles.";
+}
+
+// ---------------------------------------------------------------------
+// Tabs / search / pagination
+// ---------------------------------------------------------------------
+
+document.querySelectorAll(".tab").forEach(btn => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".tab").forEach(b => b.classList.remove("active"));
+    btn.classList.add("active");
+    currentTab = btn.dataset.status;
+    currentPage = 1;
+    loadList();
+  });
+});
+
+document.getElementById("search-input").addEventListener("input", () => {
+  clearTimeout(searchDebounce);
+  searchDebounce = setTimeout(() => {
+    currentPage = 1;
+    loadList();
+  }, 300);
+});
+
+document.getElementById("new-article-btn").addEventListener("click", () => {
+  const list = document.getElementById("list");
+  document.getElementById("empty").style.display = "none";
+  list.prepend(renderCard({
+    id: null, title: "", symptoms: "", cause: "", resolution: "",
+    keywords: [], related_systems: [], occurrence_count: 1,
+    status: "approved", source_ticket_ids: [], is_manual: true, created_at: null,
+    reviewed_by: null,
+  }, { isNew: true }));
+});
+
+// ---------------------------------------------------------------------
+// Listing (paginated — designed for hundreds of records, not "fetch
+// everything and render it all", which is what the earlier version did)
+// ---------------------------------------------------------------------
+
+async function loadList() {
+  const params = new URLSearchParams({
+    status: currentTab,
+    page: String(currentPage),
+    page_size: String(PAGE_SIZE),
+  });
+  const q = document.getElementById("search-input").value.trim();
+  if (q) params.set("q", q);
+
+  let res;
+  try {
+    res = await authedFetch(`${API}/admin/kb/articles?${params.toString()}`);
+  } catch (err) {
+    return; // authedFetch already showed the login screen
+  }
+  if (!res.ok) {
+    toast(`Error loading articles (${res.status}).`);
+    return;
+  }
+
+  const data = await res.json();
+  renderPagination(data);
+
+  const list = document.getElementById("list");
+  const empty = document.getElementById("empty");
+  list.innerHTML = "";
+
+  if (data.total === 0) {
+    empty.textContent = q ? `No results for "${q}".` : emptyMessage(currentTab);
+    empty.style.display = "block";
+    return;
+  }
+  empty.style.display = "none";
+  for (const a of data.articles) {
+    list.appendChild(renderCard(a));
+  }
+}
+
+function renderPagination(data) {
+  const el = document.getElementById("pagination");
+  if (data.pages <= 1) {
+    el.style.display = "none";
+    return;
+  }
+  el.style.display = "flex";
+  el.innerHTML = "";
+
+  const prevBtn = document.createElement("button");
+  prevBtn.textContent = "← Prev";
+  prevBtn.disabled = data.page <= 1;
+  prevBtn.addEventListener("click", () => { currentPage = data.page - 1; loadList(); });
+
+  const label = document.createElement("span");
+  label.textContent = `Page ${data.page} of ${data.pages} · ${data.total} total`;
+
+  const nextBtn = document.createElement("button");
+  nextBtn.textContent = "Next →";
+  nextBtn.disabled = data.page >= data.pages;
+  nextBtn.addEventListener("click", () => { currentPage = data.page + 1; loadList(); });
+
+  el.append(prevBtn, label, nextBtn);
+}
+
+// ---------------------------------------------------------------------
+// Card rendering
+// ---------------------------------------------------------------------
+
+function renderCard(a, opts) {
+  opts = opts || {};
+  const wrap = document.createElement("div");
+  wrap.className = "card" + (opts.isNew ? " is-new" : "");
+  wrap.dataset.id = a.id || "";
+
+  const countBadge = a.occurrence_count > 1
+    ? `<span class="badge count-1">seen ${a.occurrence_count}×</span>`
+    : `<span class="badge">${a.is_manual ? "manual" : "seen once"}</span>`;
+  const statusBadge = !opts.isNew ? `<span class="badge status-${a.status}">${a.status.replace("_", " ")}</span>` : "";
+
+  wrap.innerHTML = `
+    <div class="card-head">
+      <input type="text" class="title-input plain" placeholder="Article title" value="${esc(a.title)}" />
+      ${countBadge}
+      ${statusBadge}
+    </div>
+    <div class="card-body">
+      <div class="field">
+        <label>Symptoms</label>
+        <textarea rows="2" class="f-symptoms" placeholder="What the user observed">${esc(a.symptoms)}</textarea>
+      </div>
+      <div class="row2">
+        <div class="field">
+          <label>Cause</label>
+          <textarea rows="2" class="f-cause" placeholder="Root cause">${esc(a.cause)}</textarea>
+        </div>
+        <div class="field">
+          <label>Resolution</label>
+          <textarea rows="2" class="f-resolution" placeholder="What fixed it">${esc(a.resolution)}</textarea>
+        </div>
+      </div>
+      <div class="row2">
+        <div class="field">
+          <label>Keywords (comma-separated)</label>
+          <input type="text" class="plain f-keywords" value="${esc((a.keywords||[]).join(", "))}" />
+        </div>
+        <div class="field">
+          <label>Related systems (comma-separated)</label>
+          <input type="text" class="plain f-systems" value="${esc((a.related_systems||[]).join(", "))}" />
+        </div>
+      </div>
+    </div>
+    <div class="meta-line">${opts.isNew ? "not yet saved" : metaLine(a)}</div>
+    <div class="actions"></div>
+  `;
+
+  const actions = wrap.querySelector(".actions");
+
+  function readForm() {
+    return {
+      title: wrap.querySelector(".title-input").value,
+      symptoms: wrap.querySelector(".f-symptoms").value,
+      cause: wrap.querySelector(".f-cause").value,
+      resolution: wrap.querySelector(".f-resolution").value,
+      keywords: wrap.querySelector(".f-keywords").value.split(",").map(s => s.trim()).filter(Boolean),
+      related_systems: wrap.querySelector(".f-systems").value.split(",").map(s => s.trim()).filter(Boolean),
+    };
+  }
+
+  if (opts.isNew) {
+    const createBtn = document.createElement("button");
+    createBtn.className = "primary";
+    createBtn.textContent = "Create article";
+    createBtn.addEventListener("click", async () => {
+      const body = readForm();
+      if (!body.title.trim() || !body.resolution.trim()) {
+        toast("Title and resolution are required.");
+        return;
+      }
+      createBtn.disabled = true;
+      let res;
+      try {
+        res = await authedFetch(`${API}/admin/kb`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+      } catch (err) { createBtn.disabled = false; return; }
+      if (!res.ok) {
+        toast("Failed to create article.");
+        createBtn.disabled = false;
+        return;
+      }
+      toast("Article created and approved.");
+      wrap.remove();
+      if (currentTab === "approved") loadList();
+    });
+
+    const cancelBtn = document.createElement("button");
+    cancelBtn.textContent = "Cancel";
+    cancelBtn.addEventListener("click", () => wrap.remove());
+
+    actions.append(cancelBtn, createBtn);
+    return wrap;
+  }
+
+  const resyncBtn = document.createElement("button");
+  resyncBtn.textContent = "Fix ticket #s";
+  resyncBtn.title = "Re-resolve source ticket references to the display numbers agents see in Zoho";
+  resyncBtn.addEventListener("click", async () => {
+    resyncBtn.disabled = true;
+    let res;
+    try {
+      res = await authedFetch(`${API}/admin/kb/${a.id}/resync-ticket-numbers`, { method: "POST" });
+    } catch (err) { resyncBtn.disabled = false; return; }
+    resyncBtn.disabled = false;
+    if (!res.ok) { toast("Failed to resync ticket numbers."); return; }
+    const data = await res.json();
+    wrap.querySelector(".meta-line").innerHTML = metaLine(data.article);
+    toast(data.resolved_count > 0 ? `Resolved ${data.resolved_count} ticket ID(s).` : "Nothing to resolve — already up to date.");
+  });
+
+  const deleteBtn = document.createElement("button");
+  deleteBtn.className = "danger";
+  deleteBtn.textContent = "Delete";
+  deleteBtn.addEventListener("click", async () => {
+    if (!confirm(`Delete "${a.title}"? This can't be undone.`)) return;
+    let res;
+    try {
+      res = await authedFetch(`${API}/admin/kb/${a.id}`, { method: "DELETE" });
+    } catch (err) { return; }
+    if (!res.ok) { toast("Failed to delete."); return; }
+    toast("Article deleted.");
+    wrap.remove();
+    loadList(); // refresh pagination/totals rather than just decrementing locally
+  });
+
+  const saveBtn = document.createElement("button");
+  saveBtn.textContent = "Save edits";
+  saveBtn.addEventListener("click", async () => {
+    saveBtn.disabled = true;
+    let res;
+    try {
+      res = await authedFetch(`${API}/admin/kb/${a.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(readForm()),
+      });
+    } catch (err) { saveBtn.disabled = false; return; }
+    saveBtn.disabled = false;
+    if (!res.ok) { toast("Failed to save."); return; }
+    toast("Saved.");
+  });
+
+  actions.append(resyncBtn, deleteBtn, saveBtn);
+
+  if (currentTab === "pending_review") {
+    const rejectBtn = document.createElement("button");
+    rejectBtn.className = "reject";
+    rejectBtn.textContent = "Reject";
+    rejectBtn.addEventListener("click", () => decide(a.id, "reject", wrap));
+
+    const approveBtn = document.createElement("button");
+    approveBtn.className = "primary";
+    approveBtn.textContent = "Approve";
+    approveBtn.addEventListener("click", () => decide(a.id, "approve", wrap, readForm));
+
+    actions.append(rejectBtn, approveBtn);
+  }
+
+  return wrap;
+}
+
+function metaLine(a) {
+  const sourceTickets = `source tickets: ${(a.source_ticket_ids||[]).join(", ") || "—"}`;
+  const firstSeen = a.created_at ? new Date(a.created_at).toLocaleDateString() : "";
+  const author = a.reviewed_by ? ` · reviewed by <strong>${esc(a.reviewed_by)}</strong>` : "";
+  return `${sourceTickets} · first seen ${firstSeen}${author}`;
+}
+
+async function decide(id, action, cardEl, readForm) {
+  const buttons = cardEl.querySelectorAll("button");
+  buttons.forEach(b => b.disabled = true);
+
+  let body = undefined;
+  if (action === "approve" && readForm) {
+    body = JSON.stringify(readForm());
+  }
+
+  let res;
+  try {
+    res = await authedFetch(`${API}/admin/kb/${id}/${action}`, {
+      method: "POST",
+      headers: body ? { "Content-Type": "application/json" } : undefined,
+      body,
+    });
+  } catch (err) {
+    buttons.forEach(b => b.disabled = false);
+    return;
+  }
+
+  if (!res.ok) {
+    toast(`Failed to ${action} — try again.`);
+    buttons.forEach(b => b.disabled = false);
+    return;
+  }
+
+  toast(action === "approve" ? "Article approved and now searchable." : "Article rejected.");
+  cardEl.remove();
+  loadList(); // refresh pagination/totals
+}
+</script>
+</body>
+</html>
