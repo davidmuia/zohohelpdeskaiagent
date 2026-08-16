@@ -36,6 +36,43 @@ def init_db() -> None:
     """Create all tables if they do not already exist."""
     logger.info("Initializing database schema at %s", config.database_url)
     Base.metadata.create_all(bind=engine)
+    _run_column_migrations()
+
+
+def _run_column_migrations() -> None:
+    """
+    create_all() only creates missing TABLES, never adds columns to a
+    table that already exists — so a column added to a model after the
+    table was first created (like KBArticle.retrieval_embedding_json)
+    silently never appears on an already-deployed database, and the next
+    read/write against it fails with "no such column". This adds any
+    columns listed below if missing, so existing deployments pick up
+    schema changes automatically on restart instead of crashing.
+
+    Deliberately minimal (SQLite ADD COLUMN only, no data backfill here —
+    application code handles backfilling actual values, e.g.
+    kb_service.find_relevant_articles self-heals retrieval_embedding_json
+    lazily). Add an entry here whenever a new nullable/defaulted column is
+    added to an existing table.
+    """
+    from sqlalchemy import inspect, text
+
+    migrations = [
+        ("kb_article", "retrieval_embedding_json", "TEXT NOT NULL DEFAULT '[]'"),
+    ]
+
+    inspector = inspect(engine)
+    existing_tables = set(inspector.get_table_names())
+
+    with engine.begin() as conn:
+        for table, column, ddl_type in migrations:
+            if table not in existing_tables:
+                continue  # table itself is new — create_all() already handled it
+            existing_columns = {c["name"] for c in inspector.get_columns(table)}
+            if column in existing_columns:
+                continue
+            logger.info("Migrating schema: adding %s.%s", table, column)
+            conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl_type}"))
 
 
 @contextmanager

@@ -16,13 +16,16 @@ POST /api/analyze   -> analyze a ticket, persist the result, return JSON
 from __future__ import annotations
 
 import datetime as _dt
+import functools
+import hmac
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
-from flask import Flask, jsonify, request
+from flask import Flask, Response, jsonify, request
+from flask import session as flask_session
 from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
@@ -30,7 +33,8 @@ from flask_limiter.util import get_remote_address
 from ai_service import get_ai_service
 from config import config
 from database import get_session, init_db
-from models import TicketAnalysis
+import kb_service
+from models import KBArticle, TicketAnalysis
 import zoho_client
 
 # --------------------------------------------------------------------------
@@ -59,10 +63,78 @@ REQUIRED_TICKET_FIELDS = ("ticket_id", "subject")
 limiter = Limiter(key_func=get_remote_address, default_limits=["120 per hour"])
 
 
+def _validate_kb_session() -> Optional[str]:
+    """
+    Returns the logged-in KB reviewer's username if the session is valid
+    (present, not idle-expired), refreshing the idle timer on every call —
+    a sliding window, not a fixed one. Returns None (and clears the
+    session if it was merely stale) otherwise.
+
+    Uses flask_session (aliased on import) rather than `session`, since
+    nearly every route in this file already binds `session` locally to a
+    SQLAlchemy session via `with get_session() as session:` — importing
+    Flask's session under the same name would silently shadow it inside
+    those blocks, badly enough that `session.get("kb_admin_user")` would
+    resolve to SQLAlchemy's `Session.get()` (an ORM primary-key lookup)
+    instead of a dict-style read, a real and easy-to-miss bug.
+    """
+    username = flask_session.get("kb_admin_user")
+    last_activity_str = flask_session.get("kb_admin_last_activity")
+    if not username or not last_activity_str:
+        return None
+
+    try:
+        last_activity = _dt.datetime.fromisoformat(last_activity_str)
+    except ValueError:
+        flask_session.clear()
+        return None
+    if last_activity.tzinfo is None:
+        last_activity = last_activity.replace(tzinfo=_dt.timezone.utc)
+
+    idle_for = _dt.datetime.now(_dt.timezone.utc) - last_activity
+    if idle_for.total_seconds() > config.kb_admin_idle_timeout_minutes * 60:
+        flask_session.clear()
+        return None
+
+    # Still valid — refresh so an actively-working reviewer never gets
+    # logged out mid-session; only genuine inactivity trips the timeout.
+    flask_session["kb_admin_last_activity"] = _dt.datetime.now(_dt.timezone.utc).isoformat()
+    return username
+
+
+def _kb_session_required(view_func):
+    """
+    Session-auth guard for the KB review queue routes. Replaces Basic
+    Auth specifically because Basic Auth cannot support logout or idle
+    timeout at all — browsers cache and silently resend those credentials
+    on every request forever, with no clean way to invalidate them
+    short of the server permanently changing the password. A real login
+    form + server-side session with a sliding idle window is the
+    straightforward way to get both.
+
+    If no admin accounts are configured, the routes are disabled entirely
+    (403) rather than left open.
+    """
+
+    @functools.wraps(view_func)
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
+        if not config.kb_admin_users:
+            return jsonify({"error": "KB review is not configured on this server."}), 403
+        if not _validate_kb_session():
+            return jsonify({"error": "Not authenticated."}), 401
+        return view_func(*args, **kwargs)
+
+    return wrapped
+
+
 def create_app() -> Flask:
     """Application factory. Keeps test setup and WSGI config clean."""
     app = Flask(__name__)
     app.config["SECRET_KEY"] = config.secret_key
+    # Hard ceiling on the KB review session regardless of activity — the
+    # idle timeout (see _validate_kb_session) is a sliding window on top
+    # of this; whichever limit is hit first ends the session.
+    app.permanent_session_lifetime = _dt.timedelta(hours=config.kb_admin_session_lifetime_hours)
 
     allowed_origins = (
         "*" if config.cors_allowed_origins.strip() == "*" else config.cors_allowed_origins.split(",")
@@ -73,7 +145,39 @@ def create_app() -> Flask:
     init_db()
     register_routes(app)
     register_error_handlers(app)
+    _maybe_start_kb_scheduler()
     return app
+
+
+def _maybe_start_kb_scheduler() -> None:
+    """
+    Start the background KB scan job if enabled. In-process APScheduler —
+    no new infra. Guarded so importing app.py for tests, or running with
+    KB_SCAN_ENABLED unset, never spins up a background thread hitting the
+    Zoho/Gemini APIs unexpectedly.
+    """
+    if not config.kb_scan_enabled:
+        logger.info("KB scan scheduler disabled (KB_SCAN_ENABLED is not set).")
+        return
+
+    from apscheduler.schedulers.background import BackgroundScheduler
+
+    def _run_scan() -> None:
+        try:
+            kb_service.run_scan_pass(get_ai_service())
+        except Exception:  # noqa: BLE001 - a bad pass must never kill the scheduler thread
+            logger.exception("KB scan pass raised an unexpected error.")
+
+    scheduler = BackgroundScheduler(daemon=True)
+    scheduler.add_job(
+        _run_scan,
+        "interval",
+        minutes=config.kb_scan_interval_minutes,
+        next_run_time=_dt.datetime.now(),  # run once immediately on startup, then on the interval
+        id="kb_scan",
+    )
+    scheduler.start()
+    logger.info("KB scan scheduler started (every %s minutes).", config.kb_scan_interval_minutes)
 
 
 def register_routes(app: Flask) -> None:
@@ -126,7 +230,7 @@ def register_routes(app: Flask) -> None:
 
         ai_service = get_ai_service()
         try:
-            reply, warnings = ai_service.chat(
+            reply, warnings, web_sources = ai_service.chat(
                 ticket, clean_history, message, analysis=analysis, model_override=model_override
             )
         except Exception:  # noqa: BLE001
@@ -136,7 +240,7 @@ def register_routes(app: Flask) -> None:
         if warnings:
             return jsonify({"error": warnings[0]}), 502
 
-        return jsonify({"reply": reply}), 200
+        return jsonify({"reply": reply, "web_sources": web_sources}), 200
 
     @app.get("/api/models")
     def list_models() -> Any:
@@ -208,6 +312,87 @@ def register_routes(app: Flask) -> None:
             return jsonify({"tickets": [], "count": 0, "error": str(exc)}), 200
 
         return jsonify({"tickets": tickets, "count": len(tickets)}), 200
+
+    @app.post("/api/kb/suggest")
+    @limiter.limit("20 per hour")
+    def suggest_kb_article() -> Any:
+        """
+        Lets an agent manually suggest a KB article for the ticket they're
+        working, from the widget — pre-filled client-side from Analyze's
+        output, editable before submit. Complements the automatic scan
+        (which only covers closed IT-department tickets on a schedule):
+        this covers a fix documented before closure, one the automatic
+        extraction would've missed (e.g. resolved verbally, never clearly
+        stated in the transcript), or outside the scanned department.
+
+        Deliberately public (same trust boundary as /api/analyze, /api/chat
+        — rate-limited, not admin-session-gated) since any agent should be
+        able to suggest, not just KB reviewers. ALWAYS lands as
+        pending_review via match_or_create_article — an agent's
+        submission is a draft suggestion, same quality gate as everything
+        the auto-scan produces, never auto-approved.
+        """
+        payload = request.get_json(silent=True) or {}
+        ticket_number = str(payload.get("ticket_number") or "").strip()
+        title = str(payload.get("title") or "").strip()
+        symptoms = str(payload.get("symptoms") or "").strip()
+        cause = str(payload.get("cause") or "").strip()
+        resolution = str(payload.get("resolution") or "").strip()
+
+        if not (ticket_number and title and resolution):
+            return jsonify({"error": "ticket_number, title, and resolution are required."}), 400
+
+        keywords = payload.get("keywords") if isinstance(payload.get("keywords"), list) else []
+        related_systems = payload.get("related_systems") if isinstance(payload.get("related_systems"), list) else []
+
+        ai_service = get_ai_service()
+        result = kb_service.match_or_create_article(
+            ai_service, ticket_number, title, symptoms, cause, resolution, keywords, related_systems
+        )
+        return jsonify(result), 201
+
+    @app.get("/api/ticket/<ticket_id>/kb-relevant")
+    @limiter.limit("30 per hour")
+    def get_relevant_kb_articles(ticket_id: str) -> Any:
+        """
+        Semantic search over this org's own APPROVED KB articles for the
+        given query text — used by the widget to feed real KB context
+        into Analyze and Chat, in two stages: a preliminary lookup on raw
+        ticket text at ticket-view time, and a refined lookup on Analyze's
+        own clean `summary` right after analysis completes (see
+        loadRelevantKBArticles / refineRelevantKBArticles in app.js — the
+        widget concatenates whatever text it wants matched into `subject`
+        and `description`; this route doesn't distinguish their origin).
+
+        Costs one embedding call per invocation — the widget calls this
+        at most twice per ticket view (once preliminary, once refined),
+        not on every keystroke.
+        """
+        subject = (request.args.get("subject") or "").strip()
+        description = (request.args.get("description") or "").strip()
+        query_text = f"{subject}\n\n{description}".strip()
+        if not query_text:
+            return jsonify({"articles": [], "count": 0}), 200
+
+        ai_service = get_ai_service()
+        articles = kb_service.find_relevant_articles(ai_service, query_text)
+        return jsonify({"articles": articles, "count": len(articles)}), 200
+
+    @app.get("/api/ticket/<ticket_id>/number")
+    @limiter.limit("30 per hour")
+    def get_ticket_display_number(ticket_id: str) -> Any:
+        """
+        Resolves Zoho's internal numeric ticket ID to the short display
+        number an agent actually recognizes (e.g. "1483") — used by the
+        widget's "Suggest for Knowledge Base" submit action, since
+        currentTicket.ticket_id in the widget is the internal ID (needed
+        for the Zoho API calls this widget already makes throughout), not
+        the display number. Fetched lazily at submit time rather than
+        eagerly on every ticket view, since it's only needed if the agent
+        actually submits a suggestion.
+        """
+        ticket_number = zoho_client.get_ticket_number(ticket_id)
+        return jsonify({"ticket_number": ticket_number}), 200
 
     @app.get("/api/ticket/<ticket_id>/description")
     def get_ticket_description(ticket_id: str) -> Any:
@@ -293,6 +478,333 @@ def register_routes(app: Flask) -> None:
 
         return jsonify(response_body), 200
 
+    # ----------------------------------------------------------------
+    # Knowledge Base Builder
+    # ----------------------------------------------------------------
+
+    @app.get("/api/kb/search")
+    def kb_search() -> Any:
+        """Public (agent-facing) search over APPROVED articles only — used by the widget's KB tab."""
+        query = (request.args.get("q") or "").strip()
+        if not query:
+            return jsonify({"articles": [], "count": 0}), 200
+        articles = kb_service.search_articles(query)
+        return jsonify({"articles": articles, "count": len(articles)}), 200
+
+    @app.post("/admin/kb/login")
+    @limiter.limit("10 per minute")
+    def kb_admin_login() -> Any:
+        if not config.kb_admin_users:
+            return jsonify({"error": "KB review is not configured on this server."}), 403
+
+        payload = request.get_json(silent=True) or {}
+        username = str(payload.get("username") or "").strip()
+        password = str(payload.get("password") or "")
+
+        expected_password = config.kb_admin_users.get(username)
+        # hmac.compare_digest still runs even when the username itself
+        # doesn't exist (comparing against an empty string) — avoids
+        # leaking "valid username, wrong password" vs. "no such user"
+        # via a timing difference.
+        valid = expected_password is not None and hmac.compare_digest(password, expected_password)
+        if not valid:
+            return jsonify({"error": "Invalid username or password."}), 401
+
+        flask_session.clear()
+        flask_session["kb_admin_user"] = username
+        flask_session["kb_admin_last_activity"] = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        flask_session.permanent = True
+        return jsonify({"user": username, "idle_timeout_minutes": config.kb_admin_idle_timeout_minutes}), 200
+
+    @app.post("/admin/kb/logout")
+    def kb_admin_logout() -> Any:
+        flask_session.clear()
+        return jsonify({"ok": True}), 200
+
+    @app.get("/admin/kb/session")
+    def kb_admin_session_check() -> Any:
+        """
+        Lets the review page ask "am I still logged in?" on load without
+        guessing — returns the current user if the session is valid
+        (refreshing its idle timer, same as any other authenticated
+        call), or 401 if not. Also how the page learns the configured
+        idle timeout, so its client-side warning timer matches the
+        server's actual enforcement rather than a hardcoded guess.
+        """
+        username = _validate_kb_session()
+        if not username:
+            return jsonify({"error": "Not authenticated."}), 401
+        return jsonify({"user": username, "idle_timeout_minutes": config.kb_admin_idle_timeout_minutes}), 200
+
+    @app.get("/admin/kb/departments")
+    @_kb_session_required
+    def kb_list_departments() -> Any:
+        """
+        Lists Zoho departments so you can find the ID to set as
+        ZOHO_IT_DEPARTMENT_ID — one-time setup helper, not used by the
+        scan itself at runtime.
+        """
+        return jsonify({"departments": zoho_client.list_departments()}), 200
+
+    @app.get("/admin/kb/articles")
+    @_kb_session_required
+    def kb_list_articles() -> Any:
+        """
+        Paginated, optionally-filtered/searched article listing — the
+        review page's single data source for all three tabs (Pending /
+        Approved / Rejected) plus its search box. Replaces the old
+        separate /admin/kb/pending route: pending is just status=
+        pending_review here now, so there's one paginated code path
+        instead of two (one of which didn't paginate at all), which
+        matters once there are hundreds of rows.
+        """
+        status_filter = request.args.get("status")
+        search_query = (request.args.get("q") or "").strip()
+        page = max(1, request.args.get("page", 1, type=int) or 1)
+        page_size = min(100, max(1, request.args.get("page_size", 20, type=int) or 20))
+
+        with get_session() as session:
+            query = session.query(KBArticle)
+            if status_filter in ("pending_review", "approved", "rejected"):
+                query = query.filter(KBArticle.status == status_filter)
+            if search_query:
+                like = f"%{search_query}%"
+                query = query.filter(
+                    KBArticle.title.ilike(like)
+                    | KBArticle.symptoms.ilike(like)
+                    | KBArticle.cause.ilike(like)
+                    | KBArticle.resolution.ilike(like)
+                )
+
+            total = query.count()
+            rows = (
+                query.order_by(KBArticle.occurrence_count.desc(), KBArticle.last_seen_at.desc())
+                .offset((page - 1) * page_size)
+                .limit(page_size)
+                .all()
+            )
+            return (
+                jsonify(
+                    {
+                        "articles": [r.to_dict() for r in rows],
+                        "total": total,
+                        "page": page,
+                        "page_size": page_size,
+                        "pages": max(1, -(-total // page_size)),  # ceiling division
+                    }
+                ),
+                200,
+            )
+
+    @app.post("/admin/kb")
+    @_kb_session_required
+    def kb_create_article() -> Any:
+        """
+        Manually author a KB article from scratch — for gaps the auto-scan
+        won't cover (e.g. proactive documentation, or a fix that predates
+        the KB Builder). Goes straight to `approved`: a human deliberately
+        wrote this, so routing it through the pending queue for that same
+        human (or another reviewer) to re-approve adds a step without
+        adding safety. Still gets embedded, so future resolved tickets can
+        match against it and reinforce it like any other article.
+        """
+        payload = request.get_json(silent=True) or {}
+        title = str(payload.get("title") or "").strip()
+        symptoms = str(payload.get("symptoms") or "").strip()
+        cause = str(payload.get("cause") or "").strip()
+        resolution = str(payload.get("resolution") or "").strip()
+        if not title or not resolution:
+            return jsonify({"error": "title and resolution are required."}), 400
+
+        keywords = payload.get("keywords") if isinstance(payload.get("keywords"), list) else []
+        related_systems = payload.get("related_systems") if isinstance(payload.get("related_systems"), list) else []
+
+        ai_service = get_ai_service()
+        embed_input = kb_service._embedding_text(symptoms, cause, resolution)
+        embedding = ai_service.embed_text(embed_input, task_type="SEMANTIC_SIMILARITY")
+        retrieval_embedding = ai_service.embed_text(embed_input, task_type="RETRIEVAL_DOCUMENT")
+
+        now = _dt.datetime.now(_dt.timezone.utc)
+        with get_session() as session:
+            article = KBArticle(
+                title=title,
+                symptoms=symptoms,
+                cause=cause,
+                resolution=resolution,
+                keywords_json=_to_json_string(keywords),
+                related_systems_json=_to_json_string(related_systems),
+                embedding_json=_to_json_string(embedding or []),
+                retrieval_embedding_json=_to_json_string(retrieval_embedding or []),
+                status="approved",
+                occurrence_count=1,
+                source_ticket_ids_json=_to_json_string([]),
+                first_ticket_id="",
+                reviewed_by=flask_session.get("kb_admin_user"),
+                reviewed_at=now,
+                created_at=now,
+                last_seen_at=now,
+            )
+            session.add(article)
+            session.flush()
+            return jsonify({"article": article.to_dict()}), 201
+
+    @app.patch("/admin/kb/<int:article_id>")
+    @_kb_session_required
+    def kb_update_article(article_id: int) -> Any:
+        """
+        Edit an existing article's content — unlike /approve, this works
+        regardless of current status (pending, approved, or rejected), and
+        does NOT change status. Re-embeds if symptoms/cause/resolution
+        changed, so the similarity match used for future reinforcement
+        stays accurate to the edited text rather than the original
+        AI-generated draft.
+        """
+        payload = request.get_json(silent=True) or {}
+        with get_session() as session:
+            article = session.get(KBArticle, article_id)
+            if article is None:
+                return jsonify({"error": "Article not found."}), 404
+
+            content_changed = False
+            if "title" in payload:
+                article.title = str(payload["title"]).strip() or article.title
+            if "symptoms" in payload:
+                article.symptoms = str(payload["symptoms"]).strip()
+                content_changed = True
+            if "cause" in payload:
+                article.cause = str(payload["cause"]).strip()
+                content_changed = True
+            if "resolution" in payload:
+                article.resolution = str(payload["resolution"]).strip()
+                content_changed = True
+            if "keywords" in payload and isinstance(payload["keywords"], list):
+                article.keywords_json = _to_json_string(payload["keywords"])
+            if "related_systems" in payload and isinstance(payload["related_systems"], list):
+                article.related_systems_json = _to_json_string(payload["related_systems"])
+
+            if content_changed:
+                ai_service = get_ai_service()
+                embed_input = kb_service._embedding_text(article.symptoms, article.cause, article.resolution)
+                new_embedding = ai_service.embed_text(embed_input, task_type="SEMANTIC_SIMILARITY")
+                if new_embedding:
+                    article.embedding_json = _to_json_string(new_embedding)
+                new_retrieval_embedding = ai_service.embed_text(embed_input, task_type="RETRIEVAL_DOCUMENT")
+                if new_retrieval_embedding:
+                    article.retrieval_embedding_json = _to_json_string(new_retrieval_embedding)
+
+            session.flush()
+            return jsonify({"article": article.to_dict()}), 200
+
+    @app.delete("/admin/kb/<int:article_id>")
+    @_kb_session_required
+    def kb_delete_article(article_id: int) -> Any:
+        with get_session() as session:
+            article = session.get(KBArticle, article_id)
+            if article is None:
+                return jsonify({"error": "Article not found."}), 404
+            session.delete(article)
+            return jsonify({"deleted": article_id}), 200
+
+    @app.post("/admin/kb/<int:article_id>/resync-ticket-numbers")
+    @_kb_session_required
+    def kb_resync_ticket_numbers(article_id: int) -> Any:
+        """
+        Re-resolve an article's source ticket references from Zoho's
+        internal IDs to the display ticket numbers agents actually see —
+        for articles created before that mapping was fixed in the scan
+        pipeline (see kb_service.process_resolved_ticket). Safe to run
+        more than once.
+        """
+        with get_session() as session:
+            article = session.get(KBArticle, article_id)
+            if article is None:
+                return jsonify({"error": "Article not found."}), 404
+            resolved_count = kb_service.resync_ticket_numbers(article)
+            session.flush()
+            return jsonify({"article": article.to_dict(), "resolved_count": resolved_count}), 200
+
+    @app.get("/admin/kb/<int:article_id>")
+    @_kb_session_required
+    def kb_get_article(article_id: int) -> Any:
+        with get_session() as session:
+            article = session.get(KBArticle, article_id)
+            if article is None:
+                return jsonify({"error": "Article not found."}), 404
+            return jsonify({"article": article.to_dict()}), 200
+
+    @app.post("/admin/kb/<int:article_id>/approve")
+    @_kb_session_required
+    def kb_approve_article(article_id: int) -> Any:
+        """
+        Approve a draft, optionally with reviewer edits to the extracted
+        fields (title/symptoms/cause/resolution/keywords/related_systems)
+        sent in the request body — the reviewer is the last line of
+        quality control before something becomes searchable.
+        """
+        payload = request.get_json(silent=True) or {}
+        with get_session() as session:
+            article = session.get(KBArticle, article_id)
+            if article is None:
+                return jsonify({"error": "Article not found."}), 404
+            if article.status != "pending_review":
+                return jsonify({"error": f"Article is already '{article.status}', not pending review."}), 400
+
+            if "title" in payload:
+                article.title = str(payload["title"]).strip() or article.title
+            if "symptoms" in payload:
+                article.symptoms = str(payload["symptoms"]).strip()
+            if "cause" in payload:
+                article.cause = str(payload["cause"]).strip()
+            if "resolution" in payload:
+                article.resolution = str(payload["resolution"]).strip()
+            if "keywords" in payload and isinstance(payload["keywords"], list):
+                article.keywords_json = _to_json_string(payload["keywords"])
+            if "related_systems" in payload and isinstance(payload["related_systems"], list):
+                article.related_systems_json = _to_json_string(payload["related_systems"])
+
+            article.status = "approved"
+            article.reviewed_by = flask_session.get("kb_admin_user")
+            article.reviewed_at = _dt.datetime.now(_dt.timezone.utc)
+            session.flush()
+            return jsonify({"article": article.to_dict()}), 200
+
+    @app.post("/admin/kb/<int:article_id>/reject")
+    @_kb_session_required
+    def kb_reject_article(article_id: int) -> Any:
+        with get_session() as session:
+            article = session.get(KBArticle, article_id)
+            if article is None:
+                return jsonify({"error": "Article not found."}), 404
+            article.status = "rejected"
+            article.reviewed_by = flask_session.get("kb_admin_user")
+            article.reviewed_at = _dt.datetime.now(_dt.timezone.utc)
+            session.flush()
+            return jsonify({"article": article.to_dict()}), 200
+
+    @app.post("/admin/kb/scan")
+    @_kb_session_required
+    def kb_trigger_scan() -> Any:
+        """Manual scan trigger — useful for testing without waiting for the scheduler interval."""
+        result = kb_service.run_scan_pass(get_ai_service())
+        return jsonify(
+            {
+                "tickets_seen": result.tickets_seen,
+                "articles_created": result.articles_created,
+                "articles_reinforced": result.articles_reinforced,
+                "tickets_skipped_not_extractable": result.tickets_skipped_not_extractable,
+                "tickets_skipped_error": result.tickets_skipped_error,
+            }
+        ), 200
+
+    @app.get("/admin/kb-review")
+    def kb_review_page() -> Any:
+        """Serves the standalone review-queue page shell. Auth is enforced by the /admin/kb/* API calls it makes (session-based), not this static shell."""
+        if not config.kb_admin_users:
+            return jsonify({"error": "KB review is not configured on this server."}), 403
+        from flask import send_from_directory
+
+        return send_from_directory(Path(__file__).resolve().parent / "admin", "kb_review.html")
+
 
 def register_error_handlers(app: Flask) -> None:
     @app.errorhandler(404)
@@ -333,7 +845,7 @@ def _persist_analysis(*, ticket_id: str, subject: str | None, result: Any) -> No
         logger.exception("Failed to persist analysis for ticket_id=%s", ticket_id)
 
 
-def _to_json_string(data: dict[str, Any]) -> str:
+def _to_json_string(data: Any) -> str:
     import json
 
     return json.dumps(data, ensure_ascii=False)

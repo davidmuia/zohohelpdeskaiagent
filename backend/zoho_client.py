@@ -168,6 +168,65 @@ def get_requester_ticket_history(
     return results
 
 
+def list_departments() -> list[dict[str, Any]]:
+    """
+    List all departments in the Zoho Desk org — used purely to help find
+    the value for ZOHO_IT_DEPARTMENT_ID (see config.py). Returns an empty
+    list (never raises) on failure.
+    """
+    if not (config.zoho_client_id and config.zoho_client_secret and config.zoho_refresh_token):
+        return []
+    try:
+        access_token = _get_access_token()
+        headers = {"Authorization": f"Zoho-oauthtoken {access_token}"}
+        if config.zoho_org_id:
+            headers["orgId"] = config.zoho_org_id
+        response = requests.get(
+            f"{config.zoho_api_domain}/api/v1/departments",
+            headers=headers,
+            params={"limit": 100},
+            timeout=10,
+        )
+        response.raise_for_status()
+        departments = response.json().get("data") or []
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to list departments: %s", exc)
+        return []
+
+    return [{"id": str(d.get("id") or ""), "name": d.get("name") or ""} for d in departments]
+
+
+def get_ticket_number(ticket_id: str) -> str:
+    """
+    Resolve Zoho's internal numeric ticket ID to the short display number
+    (e.g. "1042") agents actually see in the Zoho Desk UI. Used by the KB
+    Builder's admin resync action to fix articles whose source_ticket_ids
+    were stored as internal IDs before ticket_number was threaded through
+    the scan pipeline (see kb_service.process_resolved_ticket).
+
+    Returns "" (never raises) on failure — the caller treats an
+    unresolved ID as "leave it as-is" rather than losing the reference
+    entirely.
+    """
+    if not (config.zoho_client_id and config.zoho_client_secret and config.zoho_refresh_token):
+        return ""
+    try:
+        access_token = _get_access_token()
+        headers = {"Authorization": f"Zoho-oauthtoken {access_token}"}
+        if config.zoho_org_id:
+            headers["orgId"] = config.zoho_org_id
+        response = requests.get(
+            f"{config.zoho_api_domain}/api/v1/tickets/{ticket_id}",
+            headers=headers,
+            timeout=10,
+        )
+        response.raise_for_status()
+        return str(response.json().get("ticketNumber") or "")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to resolve ticket_number for ticket_id=%s: %s", ticket_id, exc)
+        return ""
+
+
 def get_ticket_details(ticket_id: str) -> dict[str, Any]:
     """
     Fetch a ticket's own category, sub-category, and location (custom
@@ -361,6 +420,311 @@ def get_related_tickets(
     return results[:limit]
 
 
+def list_recently_resolved_tickets(since: _dt.datetime, limit: int = 50) -> list[dict[str, Any]]:
+    """
+    Fetch tickets whose status is Closed or Resolved and whose
+    modifiedTime is after `since` — the KB scan job's source of "what
+    became resolvable KB material since the last pass."
+
+    Deliberately filters on Zoho's own statusType via the `status`
+    query param rather than pulling everything and filtering client-side
+    (this org's ticket volume makes that wasteful), then re-checks
+    modifiedTime defensively in Python since API-side time filtering
+    behavior isn't guaranteed exact across Desk API versions.
+
+    Returns an empty list (rather than raising) on any failure, so a
+    scan pass that hits a transient error simply does nothing that
+    round rather than crashing the scheduler — the same `since`
+    watermark will be retried next pass.
+    """
+    if not (config.zoho_client_id and config.zoho_client_secret and config.zoho_refresh_token):
+        logger.info("Zoho OAuth not configured — skipping resolved-tickets scan.")
+        return []
+
+    try:
+        access_token = _get_access_token()
+        headers = {"Authorization": f"Zoho-oauthtoken {access_token}"}
+        if config.zoho_org_id:
+            headers["orgId"] = config.zoho_org_id
+    except ZohoAuthError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to authenticate for resolved-tickets scan: %s", exc)
+        return []
+
+    results: list[dict[str, Any]] = []
+    max_pages = 20  # safety ceiling; a 30-min poll interval should rarely need more than a page or two
+    PAGE_SIZE = 100
+
+    for page in range(max_pages):
+        try:
+            response = requests.get(
+                f"{config.zoho_api_domain}/api/v1/tickets",
+                headers=headers,
+                params={
+                    "from": page * PAGE_SIZE,
+                    "limit": PAGE_SIZE,
+                    "status": "Closed,Resolved",
+                    "sortBy": "-modifiedTime",
+                },
+                timeout=10,
+            )
+            response.raise_for_status()
+            batch = response.json().get("data") or []
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to fetch resolved-tickets page (from=%s): %s", page * PAGE_SIZE, exc)
+            break
+
+        if not batch:
+            break
+
+        stop = False
+        for t in batch:
+            modified_str = t.get("modifiedTime") or ""
+            try:
+                modified_dt = _dt.datetime.fromisoformat(modified_str.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+
+            # Results are sorted newest-modified-first, so once we hit one
+            # at or before the watermark, everything after it is too.
+            if modified_dt <= since:
+                stop = True
+                break
+
+            results.append(
+                {
+                    "ticket_id": str(t.get("id") or ""),
+                    "ticket_number": t.get("ticketNumber") or "",
+                    "subject": t.get("subject") or "",
+                    "status": t.get("status") or "",
+                    "modified_time": modified_str,
+                }
+            )
+            if len(results) >= limit:
+                stop = True
+                break
+
+        if stop or len(batch) < PAGE_SIZE:
+            break
+
+    return results
+
+
+def list_recently_resolved_tickets(since: _dt.datetime, limit: int = 50) -> list[dict[str, Any]]:
+    """
+    Fetch tickets that moved to a Closed-type status, modified after
+    `since`. Used by the KB Builder's scan job — polling rather than a
+    webhook, consistent with this module's read-only, no-webhooks design.
+
+    Detecting "resolved" does NOT rely on matching the literal status
+    label "Closed"/"Resolved" — Zoho Desk lets each org define its own
+    custom status names (e.g. "Solved", "Fixed", "Done"), grouped under
+    Open / On Hold / Closed *types*. Matching on literal English words
+    would silently match nothing for any org using different labels. The
+    reliable signal is Zoho's `closedTime` field, which Zoho itself sets
+    whenever a ticket enters a Closed-type status, regardless of the
+    status's display name. `RESOLVED_STATUS_LABELS` below is kept as a
+    secondary check purely as a fallback/diagnostic aid, and every ticket
+    status encountered is logged at DEBUG so a scan that finds nothing can
+    be diagnosed from the logs rather than being a silent black box.
+
+    Zoho's List Tickets endpoint doesn't support filtering by status set +
+    modified-time server-side, so this pages through tickets sorted
+    newest-modified-first and stops as soon as a page runs older than
+    `since` (same defensive-pagination pattern as get_related_tickets).
+    Capped to `limit` results per call — the scan job's watermark means a
+    ticket is only ever picked up once, so this doesn't need to catch
+    everything in one pass; a slow month just spreads across more scan
+    cycles.
+
+    Returns an empty list (rather than raising) if credentials aren't
+    configured or the lookup fails, so a scan cycle can log and retry next
+    time instead of crashing the scheduler.
+    """
+    if not (config.zoho_client_id and config.zoho_client_secret and config.zoho_refresh_token):
+        logger.info("Zoho OAuth not configured — skipping KB resolved-ticket scan.")
+        return []
+
+    # Defensive normalization to match _get_or_init_watermark's contract:
+    # every comparison below assumes `since` is UTC-aware. A naive value
+    # here would otherwise either raise when compared against the
+    # timezone-aware timestamps parsed below, or — worse — silently
+    # compare naive-to-naive if _parse_zoho_time also ever returns a naive
+    # value, which would compare two datetimes that don't actually share a
+    # reference frame without any error to signal it.
+    if since.tzinfo is None:
+        since = since.replace(tzinfo=_dt.timezone.utc)
+
+    RESOLVED_STATUS_LABELS = {"closed", "resolved"}  # fallback only — see docstring
+    MAX_PAGES = 50  # widened from 20: without a trusted sort order we can no longer
+    # early-exit as soon as we hit old tickets, so a large backlog needs more pages
+    # to fully cover. Watermark still keeps steady-state runs far smaller than this.
+
+    try:
+        access_token = _get_access_token()
+        headers = {"Authorization": f"Zoho-oauthtoken {access_token}"}
+        if config.zoho_org_id:
+            headers["orgId"] = config.zoho_org_id
+    except ZohoAuthError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to authenticate for KB resolved-ticket scan: %s", exc)
+        return []
+
+    results: list[dict[str, Any]] = []
+    seen_statuses: set[str] = set()  # for the one-line diagnostic summary below
+    total_seen = 0
+
+    pages_fetched = 0
+    raw_tickets_seen = 0  # every ticket returned by any page, regardless of modified time
+
+    for page in range(MAX_PAGES):
+        try:
+            request_params: dict[str, Any] = {"from": page * 100, "limit": 100}
+            if config.zoho_it_department_id:
+                # Filtered server-side by Zoho, not client-side after the
+                # fact — this is what actually cuts the number of tickets
+                # fetched (and therefore extracted/embedded) per scan,
+                # rather than just hiding non-IT tickets after paying for
+                # them anyway.
+                request_params["departmentId"] = config.zoho_it_department_id
+            response = requests.get(
+                f"{config.zoho_api_domain}/api/v1/tickets",
+                headers=headers,
+                # No sortBy relied upon here — Zoho's default/actual list
+                # order is not guaranteed to be newest-modified-first (see
+                # docstring), so pagination below does NOT assume ordering
+                # and does NOT early-exit on the first old ticket it finds.
+                params=request_params,
+                timeout=10,
+            )
+            response.raise_for_status()
+            batch = response.json().get("data") or []
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to fetch ticket page during KB scan (page=%s): %s", page, exc)
+            break
+
+        pages_fetched += 1
+        if not batch:
+            break  # true end of the ticket list
+
+        raw_tickets_seen += len(batch)
+
+        for t in batch:
+            # closedTime is preferred over modifiedTime: it's set
+            # specifically when a ticket enters a Closed-type status,
+            # which is exactly the event the KB Builder cares about — a
+            # ticket can be modified for unrelated reasons well before or
+            # after it actually closes. It also sidesteps modifiedTime
+            # coming back blank on this endpoint for some orgs/ticket
+            # states (see the diagnostic log above), rather than debugging
+            # why that field is empty. Falls back to modifiedTime only if
+            # closedTime itself is missing.
+            reference_time_str = t.get("closedTime") or t.get("modifiedTime") or ""
+            reference_time = _parse_zoho_time(reference_time_str)
+            if reference_time is None or reference_time <= since:
+                continue  # NOT a break — order isn't trusted, so keep scanning the rest of this page/later pages
+
+            total_seen += 1
+            status_label = (t.get("status") or "").strip()
+            seen_statuses.add(status_label or "(blank)")
+
+            is_closed = bool(t.get("closedTime")) or status_label.lower() in RESOLVED_STATUS_LABELS
+            if not is_closed:
+                continue
+
+            results.append(
+                {
+                    "ticket_id": str(t.get("id") or ""),
+                    "ticket_number": t.get("ticketNumber") or "",
+                    "subject": t.get("subject") or "",
+                    "status": status_label,
+                    "modified_time": reference_time_str,
+                }
+            )
+            if len(results) >= limit:
+                logger.info(
+                    "KB scan: found %d closed ticket(s) across %d page(s) (statuses seen: %s).",
+                    len(results), pages_fetched, sorted(seen_statuses),
+                )
+                return results
+
+        if len(batch) < 100:
+            break  # short page — that was the last one
+
+    if raw_tickets_seen == 0:
+        # The API call itself returned nothing at all — not even old
+        # tickets. This points away from a modified-time/status problem
+        # and toward auth/scope/org config: either credentials are wrong,
+        # the OAuth scope doesn't include ticket read access, or orgId is
+        # missing/incorrect for a multi-department account.
+        logger.warning(
+            "KB scan: the Zoho tickets API returned zero tickets across %d page(s) fetched — "
+            "this looks like an auth/scope/orgId problem rather than a filtering problem. "
+            "Check ZOHO_ORG_ID and that the OAuth token has ticket-read scope.",
+            pages_fetched,
+        )
+    elif total_seen and not results:
+        # This is the exact case reported as "no newly-resolved tickets" —
+        # tickets WERE modified since the watermark, but none looked
+        # closed. Surfacing the actual status labels seen turns "nothing
+        # happened" into "here's why," without needing to add print
+        # statements to debug it.
+        logger.info(
+            "KB scan: %d ticket(s) modified since last scan, but none had closedTime set or a "
+            "recognized closed-type status label. Status labels seen: %s. If your Zoho org uses a "
+            "custom status name for 'closed', it should still be caught via closedTime — if not, "
+            "this list tells you what label to add.",
+            total_seen, sorted(seen_statuses),
+        )
+    elif raw_tickets_seen and not total_seen:
+        # Tickets came back, but none were newer than the watermark. If
+        # you just closed a test ticket and still land here, either its
+        # modifiedTime genuinely wasn't updated by the close action (some
+        # custom workflows update status without touching modifiedTime),
+        # it's further back than the %d pages scanned this cycle, or the
+        # watermark itself is set later than the ticket's actual
+        # modifiedTime (a timezone/clock mismatch between this server and
+        # Zoho). Check the ticket's modifiedTime directly against the
+        # watermark logged by run_scan() to tell which.
+        logger.info(
+            "KB scan: %d ticket(s) fetched across %d page(s), none closed/modified after the watermark (%s).",
+            raw_tickets_seen, pages_fetched, since.isoformat(),
+        )
+    elif results:
+        logger.info("KB scan: found %d closed ticket(s) (statuses seen: %s).", len(results), sorted(seen_statuses))
+
+    return results
+
+
+def _parse_zoho_time(value: str) -> Optional[_dt.datetime]:
+    """
+    Parse Zoho's timestamp format into a UTC-aware datetime.
+
+    Handles two cases explicitly rather than trusting the string always
+    carries an offset: if it ends in "Z" or has an explicit +HH:MM offset,
+    fromisoformat already returns an aware datetime. If it has neither
+    (e.g. "2026-08-15T05:50:00.000", no zone indicator at all), Zoho is
+    still documented as returning UTC timestamps, so the naive result is
+    explicitly labeled UTC rather than left ambiguous — leaving it naive
+    is what caused watermark comparisons to be silently unsafe (see
+    kb_service._get_or_init_watermark). A parse failure is logged (not
+    just silently swallowed) since a bad format here previously looked
+    identical to "ticket too old" in the scan's results.
+    """
+    if not value:
+        return None
+    try:
+        parsed = _dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        logger.warning("KB scan: could not parse ticket timestamp %r — treating as unknown/skip.", value)
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_dt.timezone.utc)
+    return parsed
+
+
 def get_agent_resolution_context(ticket_id: str, max_messages: int = 3, max_chars: int = 900) -> Optional[str]:
     """
     Fetch the last few agent-authored messages on a ticket (not just the
@@ -428,6 +792,50 @@ def get_agent_resolution_context(ticket_id: str, max_messages: int = 3, max_char
     return combined[:max_chars]
 
 
+def fetch_ticket_comments(ticket_id: str) -> list[dict[str, Any]]:
+    """
+    Fetch internal/private notes (Zoho Desk "Comments", isPublic=false) for
+    a ticket. Distinct from `/threads`, which is customer-facing email —
+    Zoho keeps these as two separate endpoints. This matters a lot for KB
+    extraction specifically: a technician's actual diagnosis and fix often
+    live ONLY in an internal note (e.g. "reset the inkpad counter"), while
+    the customer-facing reply just says "issue resolved." Without this,
+    extraction would see no stated cause/resolution at all for tickets
+    handled that way.
+
+    Returns an empty list (never raises) on any failure, so a missing
+    scope or transient error degrades to "conversation-only" rather than
+    blocking extraction entirely.
+    """
+    if not (config.zoho_client_id and config.zoho_client_secret and config.zoho_refresh_token):
+        return []
+
+    try:
+        access_token = _get_access_token()
+        headers = {"Authorization": f"Zoho-oauthtoken {access_token}"}
+        if config.zoho_org_id:
+            headers["orgId"] = config.zoho_org_id
+
+        response = requests.get(
+            f"{config.zoho_api_domain}/api/v1/tickets/{ticket_id}/comments",
+            headers=headers,
+            params={"limit": 100},
+            timeout=10,
+        )
+        response.raise_for_status()
+        comments = response.json().get("data") or []
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to fetch internal comments for ticket_id=%s: %s", ticket_id, exc)
+        return []
+
+    # Public comments (isPublic=true) are customer-visible replies posted
+    # via the comments API rather than threads — including them here too
+    # would double them up against fetch_ticket_conversation's own thread
+    # pull in most Desk configurations, so this function only surfaces the
+    # private ones; that's the content /threads structurally cannot see.
+    return [c for c in comments if c.get("isPublic") is False]
+
+
 def fetch_ticket_conversation(ticket_id: str, max_chars: int = 4000) -> Optional[str]:
     """
     Fetch the FULL conversation for a ticket — every thread, in
@@ -476,14 +884,16 @@ def fetch_ticket_conversation(ticket_id: str, max_chars: int = 4000) -> Optional
         return None
 
     threads = payload.get("data") or []
-    if not threads:
+    comments = fetch_ticket_comments(ticket_id)
+    if not threads and not comments:
         return None
 
     # Chronological order (oldest first) — defensive sort rather than
     # trusting API ordering, same approach used elsewhere in this module.
     threads.sort(key=lambda t: t.get("createdTime") or "")
+    comments.sort(key=lambda c: c.get("commentedTime") or "")
 
-    entries: list[str] = []
+    entries: list[tuple[str, str]] = []  # (sort_key, formatted_entry)
     for t in threads:
         raw = t.get("plainText") or t.get("content") or t.get("summary") or ""
         cleaned = _html_to_text(raw)
@@ -499,10 +909,29 @@ def fetch_ticket_conversation(ticket_id: str, max_chars: int = 4000) -> Optional
         else:
             label = f"Customer — {sender_name}" if sender_name else "Customer"
 
-        entries.append(f"[{label}] {cleaned}")
+        entries.append((t.get("createdTime") or "", f"[{label}] {cleaned}"))
+
+    for c in comments:
+        raw = c.get("content") or ""
+        cleaned = _html_to_text(raw)
+        if not cleaned:
+            continue
+        commenter = c.get("commenter") or {}
+        sender_name = commenter.get("name") or ""
+        # Explicitly labeled "Internal Note" rather than folded into plain
+        # "Agent" — an agent's internal note is where the real diagnosis
+        # usually lives (it's private, so agents write frankly there in a
+        # way they may not in a customer-facing reply), so it's worth
+        # keeping visibly distinct in the transcript, not just correctly
+        # attributed to the agent.
+        label = f"Agent Internal Note — {sender_name}" if sender_name else "Agent Internal Note"
+        entries.append((c.get("commentedTime") or "", f"[{label}] {cleaned}"))
 
     if not entries:
         return None
+
+    entries.sort(key=lambda e: e[0])
+    entries = [e[1] for e in entries]
 
     full_transcript = "\n\n".join(entries)
     if len(full_transcript) <= max_chars:
