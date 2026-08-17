@@ -23,18 +23,29 @@ from models import Base
 
 logger = logging.getLogger(__name__)
 
+# Some Postgres providers (Neon included, historically also Heroku) hand
+# out connection strings starting with "postgres://" rather than
+# "postgresql://" — the former is rejected outright by some
+# SQLAlchemy/psycopg combinations. Defensive fixup so pasting a provider's
+# connection string directly into DATABASE_URL just works, rather than
+# failing with a cryptic dialect error the first time someone deploys
+# against real Postgres.
+_database_url = config.database_url
+if _database_url.startswith("postgres://"):
+    _database_url = _database_url.replace("postgres://", "postgresql://", 1)
+
 # `check_same_thread` is only relevant for SQLite; harmless to set otherwise
 # but we guard it so this engine works cleanly if DATABASE_URL is later
 # pointed at Postgres/MySQL without code changes.
-_connect_args = {"check_same_thread": False} if config.database_url.startswith("sqlite") else {}
+_connect_args = {"check_same_thread": False} if _database_url.startswith("sqlite") else {}
 
-engine = create_engine(config.database_url, connect_args=_connect_args, future=True)
+engine = create_engine(_database_url, connect_args=_connect_args, future=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 
 
 def init_db() -> None:
     """Create all tables if they do not already exist."""
-    logger.info("Initializing database schema at %s", config.database_url)
+    logger.info("Initializing database schema at %s", _database_url)
     Base.metadata.create_all(bind=engine)
     _run_column_migrations()
 

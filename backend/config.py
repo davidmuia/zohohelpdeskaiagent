@@ -51,6 +51,15 @@ class Config:
     cors_allowed_origins: str = field(default_factory=lambda: os.getenv("CORS_ALLOWED_ORIGINS", "*"))
 
     # --- Database ---
+    # Defaults to a local SQLite file — fine for local dev, but NOT
+    # durable on most free-tier hosts (e.g. Render's free web services
+    # have an ephemeral filesystem; a local SQLite file is wiped on every
+    # redeploy/restart/spin-down). For a persistent deployment, point
+    # this at a hosted Postgres instance instead — e.g. Neon
+    # (https://neon.tech) has a genuinely free tier with no forced
+    # expiry. Copy the connection string Neon gives you directly into
+    # DATABASE_URL; see database.py for one small defensive fixup this
+    # app applies to that URL (postgres:// -> postgresql://).
     database_url: str = field(
         default_factory=lambda: os.getenv("DATABASE_URL", f"sqlite:///{BASE_DIR / 'service_desk_copilot.db'}")
     )
