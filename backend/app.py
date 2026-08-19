@@ -797,6 +797,42 @@ def register_routes(app: Flask) -> None:
             session.flush()
             return jsonify({"article": article.to_dict()}), 200
 
+    @app.post("/internal/kb/scan")
+    @limiter.exempt
+    def kb_cron_trigger_scan() -> Any:
+        """
+        Scan trigger for an EXTERNAL scheduler (e.g. the GitHub Actions
+        workflow), not a logged-in reviewer — deliberately separate from
+        /admin/kb/scan (session-gated) since a cron job can't hold a
+        login session. Auth is a shared secret instead, checked via
+        header, since a URL query-string token would land in Render's
+        access logs in plaintext.
+
+        This exists because Render's free tier can't run a reliable
+        in-process background scheduler: the same 15-minute spin-down
+        that idles HTTP traffic also kills any in-process thread,
+        APScheduler included — so KB_SCAN_ENABLED's in-process scheduler
+        silently stops running whenever the process has been idle. An
+        external trigger doesn't depend on the web process having stayed
+        alive continuously.
+        """
+        if not config.kb_scan_cron_secret:
+            return jsonify({"error": "KB_SCAN_CRON_SECRET is not configured on this server."}), 403
+        provided = request.headers.get("X-Scan-Secret", "")
+        if not hmac.compare_digest(provided, config.kb_scan_cron_secret):
+            return jsonify({"error": "Invalid or missing scan secret."}), 401
+
+        result = kb_service.run_scan_pass(get_ai_service())
+        return jsonify(
+            {
+                "tickets_seen": result.tickets_seen,
+                "articles_created": result.articles_created,
+                "articles_reinforced": result.articles_reinforced,
+                "tickets_skipped_not_extractable": result.tickets_skipped_not_extractable,
+                "tickets_skipped_error": result.tickets_skipped_error,
+            }
+        ), 200
+
     @app.post("/admin/kb/scan")
     @_kb_session_required
     def kb_trigger_scan() -> Any:
