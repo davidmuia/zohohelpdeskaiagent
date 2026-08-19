@@ -39,7 +39,25 @@ if _database_url.startswith("postgres://"):
 # pointed at Postgres/MySQL without code changes.
 _connect_args = {"check_same_thread": False} if _database_url.startswith("sqlite") else {}
 
-engine = create_engine(_database_url, connect_args=_connect_args, future=True)
+# pool_pre_ping / pool_recycle matter specifically because of Neon's free
+# tier: Neon's compute auto-suspends after its own idle window, completely
+# independently of whether this Render service is awake. When that
+# happens, any connection SQLAlchemy is holding in its pool goes dead —
+# the next request to reuse it throws an OperationalError ("SSL connection
+# has been closed unexpectedly" or similar) on the very first query, which
+# surfaces as a bare 500 even on routes with no AI involvement at all
+# (e.g. GET /admin/kb/articles). pool_pre_ping issues a cheap SELECT 1
+# before handing out a pooled connection and transparently reconnects if
+# it's dead; pool_recycle proactively retires connections before Neon's
+# own suspend window is likely to have kicked in, so we replace them on
+# our terms rather than mid-request. Harmless no-ops for SQLite.
+engine = create_engine(
+    _database_url,
+    connect_args=_connect_args,
+    future=True,
+    pool_pre_ping=True,
+    pool_recycle=300,
+)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 
 
