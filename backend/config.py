@@ -43,7 +43,7 @@ class Config:
     flask_env: str = field(default_factory=lambda: os.getenv("FLASK_ENV", "development"))
     debug: bool = field(default_factory=lambda: _get_bool("FLASK_DEBUG", default=False))
     secret_key: str = field(default_factory=lambda: os.getenv("FLASK_SECRET_KEY", "dev-secret-change-me"))
-    port: int = field(default_factory=lambda: int(os.getenv("PORT", "5000")))
+    port: int = field(default_factory=lambda: int(os.getenv("PORT", "5001")))
 
     # --- CORS ---
     # Zoho Desk widgets are served from Zoho's own domains; restrict in
@@ -67,7 +67,7 @@ class Config:
     # --- AI Provider (Gemini today, swappable later) ---
     ai_provider: str = field(default_factory=lambda: os.getenv("AI_PROVIDER", "gemini"))
     gemini_api_key: str = field(default_factory=lambda: os.getenv("GEMINI_API_KEY", ""))
-    gemini_model: str = field(default_factory=lambda: os.getenv("GEMINI_MODEL", "gemini-3.6-flash"))
+    gemini_model: str = field(default_factory=lambda: os.getenv("GEMINI_MODEL", "gemini-3.5-flash"))
     ai_timeout_seconds: int = field(default_factory=lambda: int(os.getenv("AI_TIMEOUT_SECONDS", "30")))
 
     # --- Developer Mode ---
