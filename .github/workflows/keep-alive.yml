@@ -1,7 +1,7 @@
 # Two jobs against the deployed Render backend:
 #   1. keep-alive — pings /ping every 14 min (just under Render's
 #      15-minute spin-down window) so the free-tier service stays warm.
-#   2. trigger-scan — calls /internal/kb/scan every 30 min. This is NOT
+#   2. trigger-scan — calls /internal/kb/scan every ~28 min. This is NOT
 #      redundant with Render's own in-process scheduler: Render's free
 #      tier kills any in-process background thread (APScheduler
 #      included) the same way it idles HTTP traffic, so KB_SCAN_ENABLED's
@@ -10,6 +10,16 @@
 #      the web process having stayed alive continuously — this is the
 #      free-tier-compatible alternative to Render's own Cron Job service
 #      type, which costs $5/mo and isn't part of the free tier.
+#
+# NOTE: this used to pick out "every other run" via
+#   github.run_number % 2 == 0
+# GitHub Actions' expression language has no arithmetic operators at all
+# (only ==, !=, !, &&, ||, <, <=, >, >=) — `%` is not valid there, so that
+# condition failed workflow validation outright ("Invalid workflow file"),
+# meaning trigger-scan never ran on schedule. Fixed below by giving the
+# workflow two separate `schedule` entries instead: GitHub sets
+# github.event.schedule to whichever cron string actually fired a given
+# run, so each job just checks which one it is — no modulo needed.
 #
 # Setup — two repository variables/secrets needed (Settings > Secrets and
 # variables > Actions):
@@ -20,12 +30,14 @@ name: Keep Render backend alive and trigger KB scans
 
 on:
   schedule:
-    - cron: "*/14 * * * *"
+    - cron: "*/14 * * * *"   # keep-alive cadence
+    - cron: "*/28 * * * *"   # scan cadence (~ every other keep-alive tick, close to KB_SCAN_INTERVAL_MINUTES=30)
   workflow_dispatch: {}
 
 jobs:
   keep-alive:
     runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '*/14 * * * *'
     steps:
       - name: Ping backend /ping route
         run: |
@@ -37,10 +49,7 @@ jobs:
 
   trigger-scan:
     runs-on: ubuntu-latest
-    # Every other run (~28 min apart) rather than every 14 — close enough
-    # to the app's own KB_SCAN_INTERVAL_MINUTES=30 without adding a
-    # second cron schedule; skip via a cheap minute-based check.
-    if: github.event_name == 'workflow_dispatch' || (github.event.schedule && (github.run_number % 2 == 0))
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '*/28 * * * *'
     steps:
       - name: Trigger KB scan
         run: |
