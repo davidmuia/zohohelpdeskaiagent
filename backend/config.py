@@ -43,7 +43,7 @@ class Config:
     flask_env: str = field(default_factory=lambda: os.getenv("FLASK_ENV", "development"))
     debug: bool = field(default_factory=lambda: _get_bool("FLASK_DEBUG", default=False))
     secret_key: str = field(default_factory=lambda: os.getenv("FLASK_SECRET_KEY", "dev-secret-change-me"))
-    port: int = field(default_factory=lambda: int(os.getenv("PORT", "5001")))
+    port: int = field(default_factory=lambda: int(os.getenv("PORT", "5000")))
 
     # --- CORS ---
     # Zoho Desk widgets are served from Zoho's own domains; restrict in
@@ -67,7 +67,7 @@ class Config:
     # --- AI Provider (Gemini today, swappable later) ---
     ai_provider: str = field(default_factory=lambda: os.getenv("AI_PROVIDER", "gemini"))
     gemini_api_key: str = field(default_factory=lambda: os.getenv("GEMINI_API_KEY", ""))
-    gemini_model: str = field(default_factory=lambda: os.getenv("GEMINI_MODEL", "gemini-3.5-flash"))
+    gemini_model: str = field(default_factory=lambda: os.getenv("GEMINI_MODEL", "gemini-3.6-flash"))
     ai_timeout_seconds: int = field(default_factory=lambda: int(os.getenv("AI_TIMEOUT_SECONDS", "30")))
 
     # --- Developer Mode ---
@@ -205,6 +205,13 @@ class Config:
     # fresh deploy doesn't start scanning/spending AI quota until someone
     # deliberately enables it.
     kb_scan_enabled: bool = field(default_factory=lambda: _get_bool("KB_SCAN_ENABLED", default=False))
+    # Shared secret for /internal/kb/scan — lets an external scheduler
+    # (GitHub Actions cron) trigger a scan without a login session. Leave
+    # blank to disable that route entirely (403). Separate from
+    # KB_SCAN_ENABLED: the in-process scheduler can stay off while this
+    # external trigger is used instead, which is the recommended setup on
+    # Render's free tier (see /internal/kb/scan's docstring for why).
+    kb_scan_cron_secret: str = field(default_factory=lambda: os.getenv("KB_SCAN_CRON_SECRET", ""))
     kb_scan_interval_minutes: int = field(
         default_factory=lambda: int(os.getenv("KB_SCAN_INTERVAL_MINUTES", "30"))
     )
