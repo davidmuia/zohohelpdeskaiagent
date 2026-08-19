@@ -1,0 +1,34 @@
+# Pings the deployed backend's lightweight /ping route every 14 minutes —
+# just under Render's free-tier 15-minute inactivity spin-down window —
+# so the service stays warm instead of cold-starting on the next real
+# request. Deliberately hits /ping (no AI/DB cost) rather than /api/health
+# (which calls Gemini to verify reachability — real, unnecessary cost if
+# pinged this often).
+#
+# Setup: set the BACKEND_URL repository variable (Settings > Secrets and
+# variables > Actions > Variables) to your deployed Render URL, e.g.
+# https://your-service.onrender.com — no trailing slash.
+#
+# Known limitation (not a guarantee): GitHub Actions' own cron scheduler
+# can be delayed under platform load, especially for infrequently-used
+# repos, so this reduces cold starts significantly but doesn't eliminate
+# them with 100% certainty. For a fully reliable always-on service,
+# Render's paid tier removes spin-down entirely.
+name: Keep Render backend alive
+
+on:
+  schedule:
+    - cron: "*/14 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping backend /ping route
+        run: |
+          if [ -z "${{ vars.BACKEND_URL }}" ]; then
+            echo "BACKEND_URL repository variable is not set — see workflow file comments."
+            exit 1
+          fi
+          curl -fsS "${{ vars.BACKEND_URL }}/ping" || echo "Ping failed — service may have been mid-cold-start; next scheduled ping will retry."
