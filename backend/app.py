@@ -181,6 +181,22 @@ def _maybe_start_kb_scheduler() -> None:
 
 
 def register_routes(app: Flask) -> None:
+    @app.get("/ping")
+    @limiter.exempt
+    def ping() -> Any:
+        """
+        Trivial liveness check — no AI call, no DB query, no Zoho call.
+        Exists purely so an external keep-alive pinger (e.g. a GitHub
+        Actions cron every ~14 min) can stop Render's free-tier service
+        from spinning down after 15 min of inactivity, without wasting
+        Gemini quota the way pinging /api/health would (that route
+        deliberately calls ai_service.health_check() to verify real
+        reachability — not what a keep-alive ping needs). Exempted from
+        rate limiting since a keep-alive job legitimately calls this very
+        often, on a predictable schedule, and that's fine.
+        """
+        return jsonify({"status": "ok"}), 200
+
     @app.get("/api/health")
     def health() -> Any:
         ai_service = get_ai_service()
