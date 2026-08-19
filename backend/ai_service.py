@@ -180,8 +180,25 @@ class GeminiProvider(AIProvider):
     def _get_client(self):
         if self._client is None:
             from google import genai  # Imported lazily so the module is optional at import time.
+            from google.genai import types
 
-            self._client = genai.Client(api_key=self._api_key)
+            # config.ai_timeout_seconds (AI_TIMEOUT_SECONDS) previously did
+            # nothing — the SDK was never given a timeout, so a slow or
+            # stalled Gemini call could hang far longer than the app's own
+            # request budget. Untimed calls are exactly what let a single
+            # degraded response blow through gunicorn's (much shorter)
+            # worker timeout, which kills the worker mid-request and hands
+            # the client a raw non-JSON error instead of a clean failure.
+            # HttpOptions.timeout is in milliseconds.
+            #
+            # NOTE: HttpOptions timeout enforcement has had known flakiness
+            # in some google-genai SDK versions (this pins 0.3.0) — treat
+            # this as a real fix, not a substitute for also capping the
+            # gunicorn worker timeout server-side (see Procfile).
+            self._client = genai.Client(
+                api_key=self._api_key,
+                http_options=types.HttpOptions(timeout=config.ai_timeout_seconds * 1000),
+            )
         return self._client
 
     def generate(self, system_prompt: str, user_prompt: str, model: Optional[str] = None) -> str:
