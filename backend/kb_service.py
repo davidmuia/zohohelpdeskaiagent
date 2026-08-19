@@ -457,9 +457,22 @@ def find_relevant_articles(
 def run_scan_pass(ai_service: AIService) -> ScanResult:
     """
     One full scan pass: find tickets resolved since the last watermark,
-    process each, advance the watermark. Safe to call repeatedly (e.g. by
-    the scheduler) — a failed or partial pass simply leaves the watermark
-    where it was, so nothing is silently skipped.
+    process each in chronological order, advancing the watermark after
+    every ticket (not just at the end of the batch). Safe to call
+    repeatedly (e.g. by the scheduler) — a failed, timed-out, or
+    externally-killed pass leaves the watermark at the last ticket it
+    actually finished, so already-processed tickets are never silently
+    skipped AND never endlessly re-fetched from the original starting
+    point either.
+
+    Per-ticket watermark advancement (rather than one commit at the end)
+    matters specifically on a free-tier host: kb_scan_batch_size tickets,
+    each needing a Zoho fetch plus one or more Gemini calls, can easily
+    take longer than the process has before something (gunicorn's worker
+    timeout, Render's own proxy) kills the request. Committing progress as
+    we go means that kill loses at most the one ticket in flight, not the
+    whole pass — and the next scheduled run picks up right after it
+    instead of re-walking the same early tickets forever.
     """
     result = ScanResult()
 
@@ -476,10 +489,36 @@ def run_scan_pass(ai_service: AIService) -> ScanResult:
             _advance_watermark(session, scan_started_at)
         return result
 
-    for t in tickets:
-        outcome = process_resolved_ticket(
-            ai_service, t["ticket_id"], t.get("ticket_number", ""), t.get("subject", "")
-        )
+    # zoho_client.list_recently_resolved_tickets does NOT guarantee
+    # newest/oldest ordering (see its docstring) — sort here so that
+    # "advance the watermark to this ticket's own time" is actually safe:
+    # once ticket i is processed, every ticket at or before its time in
+    # this batch is guaranteed to have been attempted already. Tickets
+    # with an unparseable timestamp are pushed to the end and processed,
+    # but never used to advance the watermark, since we can't be sure
+    # nothing earlier is still waiting behind them.
+    def _sort_key(t: dict[str, Any]) -> tuple[int, _dt.datetime]:
+        parsed = zoho_client._parse_zoho_time(t.get("modified_time") or "")
+        if parsed is None:
+            return (1, scan_started_at)  # unparseable — sort last, never advances the watermark
+        return (0, parsed)
+
+    tickets_sorted = sorted(tickets, key=_sort_key)
+
+    for t in tickets_sorted:
+        try:
+            outcome = process_resolved_ticket(
+                ai_service, t["ticket_id"], t.get("ticket_number", ""), t.get("subject", "")
+            )
+        except Exception:  # noqa: BLE001 - one bad ticket (e.g. a Gemini call that
+            # still fails despite the timeout fix) must not lose progress on
+            # every other ticket already handled this pass.
+            logger.exception(
+                "KB scan: unhandled error processing ticket=%s — counting as error, continuing.",
+                t.get("ticket_number") or t.get("ticket_id"),
+            )
+            outcome = "error"
+
         if outcome == "created":
             result.articles_created += 1
         elif outcome == "reinforced":
@@ -489,8 +528,18 @@ def run_scan_pass(ai_service: AIService) -> ScanResult:
         else:
             result.tickets_skipped_error += 1
 
-    with get_session() as session:
-        _advance_watermark(session, scan_started_at)
+        reference_time = zoho_client._parse_zoho_time(t.get("modified_time") or "")
+        if reference_time is not None:
+            with get_session() as session:
+                _advance_watermark(session, reference_time)
+
+    # Only jump the watermark all the way to scan_started_at once every
+    # ticket in the batch has actually been attempted — otherwise this
+    # would skip anything past the last one processed if the batch was
+    # truncated by kb_scan_batch_size (more tickets exist than we fetched).
+    if len(tickets_sorted) < config.kb_scan_batch_size:
+        with get_session() as session:
+            _advance_watermark(session, scan_started_at)
 
     logger.info(
         "KB scan complete: seen=%s created=%s reinforced=%s not_extractable=%s errors=%s",
