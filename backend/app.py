@@ -382,6 +382,27 @@ def register_routes(app: Flask) -> None:
             return jsonify({"error": str(exc)}), 409
         return jsonify(result), 201
 
+    @app.get("/api/kb/suggest/status")
+    @limiter.limit("30 per hour")
+    def get_kb_suggestion_status() -> Any:
+        """
+        Lets the widget check what actually happened to a KB suggestion
+        submission after its own POST appeared to fail (dropped
+        connection, timeout) — the point of idempotency_key: the server's
+        own record of the outcome is authoritative, the client's broken
+        connection is not. Returns 404 if the key is unrecognized (the
+        POST never reached the server at all, so there's genuinely
+        nothing to report here).
+        """
+        idempotency_key = (request.args.get("idempotency_key") or "").strip()
+        if not idempotency_key:
+            return jsonify({"error": "idempotency_key is required."}), 400
+
+        status = kb_service.get_submission_status(idempotency_key)
+        if status is None:
+            return jsonify({"error": "No submission found for this idempotency_key."}), 404
+        return jsonify(status), 200
+
     @app.get("/api/ticket/<ticket_id>/kb-relevant")
     @limiter.limit("30 per hour")
     def get_relevant_kb_articles(ticket_id: str) -> Any:
