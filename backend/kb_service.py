@@ -211,7 +211,7 @@ def match_or_create_article(
                     display_id, best_article.id, best_article.occurrence_count, best_score,
                     ", merge check skipped" if merge_check is None else "",
                 )
-            return {"action": "reinforced", "article_id": best_article.id}
+            return {"action": "reinforced", "article_id": best_article.id, "article_title": best_article.title}
 
         # No strong match — create a new draft. Always pending_review,
         # even for a manually-suggested article — an agent's suggestion
@@ -239,7 +239,7 @@ def match_or_create_article(
         session.add(article)
         session.flush()
         logger.info("KB: ticket=%s created new draft article id=%s (best_score=%.3f)", display_id, article.id, best_score)
-        return {"action": "created", "article_id": article.id}
+        return {"action": "created", "article_id": article.id, "article_title": article.title}
 
 
 # How long submit_kb_suggestion will wait for a genuinely concurrent
@@ -315,7 +315,12 @@ def submit_kb_suggestion(
                         "KB submit: idempotency_key=%s already completed (action=%s, article_id=%s) — replaying.",
                         idempotency_key, existing.result_action, existing.result_article_id,
                     )
-                    return existing.to_result_dict()
+                    result = existing.to_result_dict()
+                    if existing.result_article_id is not None:
+                        article = session.get(KBArticle, existing.result_article_id)
+                        if article is not None:
+                            result["article_title"] = article.title
+                    return result
 
                 if existing.status == "failed":
                     logger.info(
@@ -365,6 +370,41 @@ def submit_kb_suggestion(
             row.completed_at = _dt.datetime.now(_dt.timezone.utc)
 
     return result
+
+
+def get_submission_status(idempotency_key: str) -> Optional[dict[str, Any]]:
+    """
+    Read-only lookup for the widget to fall back on when its own
+    POST /api/kb/suggest appeared to fail (timed out, connection dropped)
+    but may well have actually succeeded server-side — exactly the
+    situation idempotency_key exists to resolve authoritatively instead
+    of the UI guessing from a broken connection.
+
+    Returns None if the key is unrecognized (e.g. the POST never even
+    reached the server, so there's genuinely nothing to report — the
+    original failure message is the correct thing to show). Otherwise
+    returns status plus, for a completed submission, the actual article
+    title/status — not just its id — since a raw database id means
+    nothing to an agent looking at the widget.
+    """
+    with get_session() as session:
+        row = (
+            session.query(KBSubmissionIdempotency)
+            .filter(KBSubmissionIdempotency.idempotency_key == idempotency_key)
+            .one_or_none()
+        )
+        if row is None:
+            return None
+
+        info: dict[str, Any] = {"status": row.status, "action": row.result_action}
+        if row.status == "failed":
+            info["error"] = row.error_message
+        if row.status == "completed" and row.result_article_id is not None:
+            article = session.get(KBArticle, row.result_article_id)
+            if article is not None:
+                info["article_title"] = article.title
+                info["article_status"] = article.status  # e.g. "pending_review"
+        return info
 
 
 def process_resolved_ticket(ai_service: AIService, ticket_id: str, ticket_number: str, subject: str) -> str:
