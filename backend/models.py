@@ -185,3 +185,46 @@ class KBScanState(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
     last_scanned_at: Mapped[_dt.datetime] = mapped_column(DateTime, nullable=False)
+
+
+class KBSubmissionIdempotency(Base):
+    """
+    Guards POST /api/kb/suggest against being processed twice for what was
+    really a single agent action — specifically the widget's own
+    cold-start/network-drop retry, which can genuinely re-send the same
+    submission if the first attempt's response never made it back to the
+    browser even though the server went on to complete it. This is a
+    different problem from (and complementary to) KBArticle's own
+    similarity-based dedup: that one merges genuinely different
+    submissions that happen to describe the same underlying issue;
+    this one exists purely to make an exact retry of the same click a
+    no-op instead of a second real submission.
+
+    The unique constraint on idempotency_key is what actually enforces
+    "claim once" under concurrency — the INSERT racing two near-
+    simultaneous requests with the same key will succeed for exactly one
+    of them, the other gets an IntegrityError and falls back to reading
+    (or briefly waiting on) this row instead of proceeding independently.
+
+    status: "processing" (claimed, work not yet finished) ->
+        "completed" (result_action/result_article_id are populated) or
+        "failed" (error_message populated; a later request with the same
+        key is allowed to retry rather than being stuck behind a dead
+        attempt forever).
+    """
+
+    __tablename__ = "kb_submission_idempotency"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False, unique=True, index=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="processing")
+    result_action: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    result_article_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[_dt.datetime] = mapped_column(
+        DateTime, nullable=False, default=lambda: _dt.datetime.now(_dt.timezone.utc)
+    )
+    completed_at: Mapped[Optional[_dt.datetime]] = mapped_column(DateTime, nullable=True)
+
+    def to_result_dict(self) -> dict[str, Any]:
+        return {"action": self.result_action, "article_id": self.result_article_id}
