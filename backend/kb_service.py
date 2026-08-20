@@ -23,13 +23,16 @@ import json
 import logging
 import math
 import re
+import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
-from ai_service import AIService
+from sqlalchemy.exc import IntegrityError
+
+from ai_service import AIService, AIProviderError
 from config import config
 from database import get_session
-from models import KBArticle, KBScanState
+from models import KBArticle, KBScanState, KBSubmissionIdempotency
 import zoho_client
 
 logger = logging.getLogger(__name__)
@@ -237,6 +240,131 @@ def match_or_create_article(
         session.flush()
         logger.info("KB: ticket=%s created new draft article id=%s (best_score=%.3f)", display_id, article.id, best_score)
         return {"action": "created", "article_id": article.id}
+
+
+# How long submit_kb_suggestion will wait for a genuinely concurrent
+# request under the same idempotency_key to finish before giving up and
+# telling the caller honestly rather than starting duplicate work.
+# Generous relative to the widget's own ~20s cold-start retry wait.
+_IDEMPOTENCY_POLL_INTERVAL_SECONDS = 2
+_IDEMPOTENCY_POLL_MAX_WAIT_SECONDS = 45
+
+
+def submit_kb_suggestion(
+    ai_service: AIService,
+    idempotency_key: Optional[str],
+    display_id: str,
+    title: str,
+    symptoms: str,
+    cause: str,
+    resolution: str,
+    keywords: list[str],
+    related_systems: list[str],
+) -> dict[str, Any]:
+    """
+    Idempotency-aware wrapper around match_or_create_article for the
+    manual "Suggest for KB" submit action. This is a different problem
+    from (and complements, doesn't replace) KBArticle's own similarity
+    dedup inside match_or_create_article: that one merges genuinely
+    different submissions that happen to describe the same underlying
+    issue; this one exists purely so a retried *same* click — e.g. the
+    widget's own network-drop retry firing after the original request
+    actually succeeded server-side but the response never made it back
+    to the browser — is a no-op replay instead of a second real
+    submission (and, as a bonus, skips redoing the AI calls entirely on
+    a replay).
+
+    If idempotency_key is falsy, behaves exactly like calling
+    match_or_create_article directly — only the widget's submit button
+    is expected to supply one; nothing else is required to.
+
+    Concurrency model: idempotency_key has a unique DB constraint
+    (KBSubmissionIdempotency), so exactly one caller can "claim" a given
+    key at a time. A second, truly concurrent request under the same key
+    (e.g. a fast double-click, or the retry actually reaching the server
+    while the first attempt is still being processed) polls briefly for
+    the first to finish rather than proceeding independently, and either
+    replays its result or — if it takes too long — fails honestly with a
+    clear message instead of silently duplicating the work.
+    """
+    if not idempotency_key:
+        return match_or_create_article(
+            ai_service, display_id, title, symptoms, cause, resolution, keywords, related_systems
+        )
+
+    waited = 0.0
+    while True:
+        try:
+            with get_session() as session:
+                session.add(KBSubmissionIdempotency(idempotency_key=idempotency_key, status="processing"))
+            break  # insert succeeded — we own this key, proceed to do the real work below
+        except IntegrityError:
+            # Someone already claimed this key. Figure out what happened
+            # to their attempt rather than assuming any particular outcome.
+            with get_session() as session:
+                existing = (
+                    session.query(KBSubmissionIdempotency)
+                    .filter(KBSubmissionIdempotency.idempotency_key == idempotency_key)
+                    .one_or_none()
+                )
+                if existing is None:
+                    continue  # deleted between the failed insert and this read — just retry claiming it
+
+                if existing.status == "completed":
+                    logger.info(
+                        "KB submit: idempotency_key=%s already completed (action=%s, article_id=%s) — replaying.",
+                        idempotency_key, existing.result_action, existing.result_article_id,
+                    )
+                    return existing.to_result_dict()
+
+                if existing.status == "failed":
+                    logger.info(
+                        "KB submit: idempotency_key=%s previously failed (%s) — allowing retry.",
+                        idempotency_key, existing.error_message,
+                    )
+                    existing.status = "processing"
+                    existing.error_message = None
+                    break  # we now own it — proceed to do the real work below
+
+                # status == "processing": a genuinely concurrent request
+                # owns it right now — wait rather than racing it.
+            if waited >= _IDEMPOTENCY_POLL_MAX_WAIT_SECONDS:
+                raise AIProviderError(
+                    "This suggestion is still being processed from an earlier attempt. "
+                    "Please check the KB review queue before submitting again."
+                )
+            time.sleep(_IDEMPOTENCY_POLL_INTERVAL_SECONDS)
+            waited += _IDEMPOTENCY_POLL_INTERVAL_SECONDS
+
+    try:
+        result = match_or_create_article(
+            ai_service, display_id, title, symptoms, cause, resolution, keywords, related_systems
+        )
+    except Exception as exc:
+        with get_session() as session:
+            row = (
+                session.query(KBSubmissionIdempotency)
+                .filter(KBSubmissionIdempotency.idempotency_key == idempotency_key)
+                .one_or_none()
+            )
+            if row is not None:
+                row.status = "failed"
+                row.error_message = str(exc)[:1000]
+        raise
+
+    with get_session() as session:
+        row = (
+            session.query(KBSubmissionIdempotency)
+            .filter(KBSubmissionIdempotency.idempotency_key == idempotency_key)
+            .one_or_none()
+        )
+        if row is not None:
+            row.status = "completed"
+            row.result_action = result.get("action")
+            row.result_article_id = result.get("article_id")
+            row.completed_at = _dt.datetime.now(_dt.timezone.utc)
+
+    return result
 
 
 def process_resolved_ticket(ai_service: AIService, ticket_id: str, ticket_number: str, subject: str) -> str:
