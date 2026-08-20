@@ -30,7 +30,7 @@ from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
-from ai_service import get_ai_service
+from ai_service import AIProviderError, get_ai_service
 from config import config
 from database import get_session, init_db
 import kb_service
@@ -354,6 +354,11 @@ def register_routes(app: Flask) -> None:
         symptoms = str(payload.get("symptoms") or "").strip()
         cause = str(payload.get("cause") or "").strip()
         resolution = str(payload.get("resolution") or "").strip()
+        # Optional — only the widget's submit button is expected to send
+        # this (a fresh client-generated key per click, reused across its
+        # own cold-start/network-drop retries). Any other caller that
+        # omits it just gets the old non-idempotent behavior.
+        idempotency_key = str(payload.get("idempotency_key") or "").strip() or None
 
         if not (ticket_number and title and resolution):
             return jsonify({"error": "ticket_number, title, and resolution are required."}), 400
@@ -362,9 +367,19 @@ def register_routes(app: Flask) -> None:
         related_systems = payload.get("related_systems") if isinstance(payload.get("related_systems"), list) else []
 
         ai_service = get_ai_service()
-        result = kb_service.match_or_create_article(
-            ai_service, ticket_number, title, symptoms, cause, resolution, keywords, related_systems
-        )
+        try:
+            result = kb_service.submit_kb_suggestion(
+                ai_service, idempotency_key, ticket_number, title, symptoms, cause, resolution,
+                keywords, related_systems,
+            )
+        except AIProviderError as exc:
+            # Specifically the "still being processed from an earlier
+            # attempt" case — a genuine concurrent duplicate under the same
+            # idempotency_key that didn't resolve within the poll window.
+            # 409 Conflict, not 500: this isn't a server error, it's an
+            # expected, distinct condition the widget should message
+            # differently than "something broke."
+            return jsonify({"error": str(exc)}), 409
         return jsonify(result), 201
 
     @app.get("/api/ticket/<ticket_id>/kb-relevant")
