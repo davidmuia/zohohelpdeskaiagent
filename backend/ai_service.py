@@ -22,6 +22,7 @@ AnalysisResult        Typed result object returned by AIService.analyze_ticket()
 from __future__ import annotations
 
 import abc
+import concurrent.futures
 import html as html_module
 import json
 import logging
@@ -164,6 +165,50 @@ class AIProvider(abc.ABC):
         raise NotImplementedError
 
 
+# Shared across all GeminiProvider instances/calls. Sized generously
+# relative to actual concurrency: this app runs gunicorn with a single
+# sync worker (see Procfile), so at most one Flask request — and
+# therefore at most one Gemini call — is ever in flight at a time in
+# practice; this just needs enough headroom to never itself become a
+# bottleneck.
+_AI_CALL_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=8, thread_name_prefix="gemini-call"
+)
+
+
+def _call_with_app_timeout(timeout_seconds: float, fn, /, *args: Any, **kwargs: Any) -> Any:
+    """
+    Enforces config.ai_timeout_seconds around a Gemini SDK call at the
+    application level, instead of relying on the SDK's own timeout
+    support.
+
+    This exists because google-genai==0.3.0 (the version pinned in
+    requirements.txt) accepts an http_options.timeout at Client
+    construction time but never actually reads it on the API-key
+    (non-Vertex) request path — verified directly against the installed
+    package: ApiClient._request_unauthorized calls
+    requests.Session.send(request, stream=stream) with no timeout kwarg
+    at all. So without this wrapper, a stalled Gemini call can hang
+    indefinitely regardless of AI_TIMEOUT_SECONDS, all the way until
+    gunicorn's own worker timeout kills the whole process (see Procfile)
+    — a much blunter and slower backstop.
+
+    Runs the call in a worker thread and gives up waiting after
+    timeout_seconds, raising TimeoutError. Note this can't forcibly
+    cancel the underlying network call (Python threads aren't
+    preemptible) — the abandoned call keeps running in the background
+    and its result is simply discarded — but it does let the Flask
+    request return promptly with a clean error instead of hanging.
+    """
+    future = _AI_CALL_EXECUTOR.submit(fn, *args, **kwargs)
+    try:
+        return future.result(timeout=timeout_seconds)
+    except concurrent.futures.TimeoutError as exc:
+        raise TimeoutError(
+            f"Gemini call did not complete within {timeout_seconds}s (application-level timeout)."
+        ) from exc
+
+
 class GeminiProvider(AIProvider):
     """AIProvider implementation backed by Google Gemini (google-genai SDK)."""
 
@@ -180,7 +225,6 @@ class GeminiProvider(AIProvider):
     def _get_client(self):
         if self._client is None:
             from google import genai  # Imported lazily so the module is optional at import time.
-            from google.genai import types
 
             # config.ai_timeout_seconds (AI_TIMEOUT_SECONDS) previously did
             # nothing — the SDK was never given a timeout, so a slow or
@@ -189,15 +233,22 @@ class GeminiProvider(AIProvider):
             # degraded response blow through gunicorn's (much shorter)
             # worker timeout, which kills the worker mid-request and hands
             # the client a raw non-JSON error instead of a clean failure.
-            # HttpOptions.timeout is in milliseconds.
             #
-            # NOTE: HttpOptions timeout enforcement has had known flakiness
-            # in some google-genai SDK versions (this pins 0.3.0) — treat
-            # this as a real fix, not a substitute for also capping the
-            # gunicorn worker timeout server-side (see Procfile).
+            # IMPORTANT: this pins google-genai==0.3.0 (see requirements.txt),
+            # and that version has NO google.genai.types.HttpOptions at all —
+            # only a private, internal type. A plain dict is what this
+            # version's Client actually accepts for http_options (verified
+            # directly against the installed 0.3.0 package), so that's used
+            # here instead of importing anything from `types`. If
+            # google-genai is ever upgraded, re-check this — newer versions
+            # do export types.HttpOptions and may prefer that form, and its
+            # timeout enforcement has had its own known flakiness across
+            # versions, which is exactly why the gunicorn worker timeout
+            # (see Procfile) stays in place as a backstop regardless.
+            # Units here are milliseconds.
             self._client = genai.Client(
                 api_key=self._api_key,
-                http_options=types.HttpOptions(timeout=config.ai_timeout_seconds * 1000),
+                http_options={"timeout": config.ai_timeout_seconds * 1000},
             )
         return self._client
 
@@ -207,7 +258,9 @@ class GeminiProvider(AIProvider):
         client = self._get_client()
         effective_model = model or self._model
         try:
-            response = client.models.generate_content(
+            response = _call_with_app_timeout(
+                config.ai_timeout_seconds,
+                client.models.generate_content,
                 model=effective_model,
                 contents=user_prompt,
                 config=types.GenerateContentConfig(
@@ -236,7 +289,12 @@ class GeminiProvider(AIProvider):
         try:
             client = self._get_client()
             # A minimal, cheap call to confirm credentials/network are OK.
-            client.models.generate_content(model=self._model, contents="ping")
+            _call_with_app_timeout(
+                config.ai_timeout_seconds,
+                client.models.generate_content,
+                model=self._model,
+                contents="ping",
+            )
             return True
         except Exception:  # noqa: BLE001
             logger.exception("Gemini health check failed")
@@ -265,7 +323,9 @@ class GeminiProvider(AIProvider):
         tools = [types.Tool(google_search=types.GoogleSearch())] if enable_web_grounding else None
 
         try:
-            response = client.models.generate_content(
+            response = _call_with_app_timeout(
+                config.ai_timeout_seconds,
+                client.models.generate_content,
                 model=effective_model,
                 contents=contents,
                 config=types.GenerateContentConfig(
@@ -332,8 +392,14 @@ class GeminiProvider(AIProvider):
 
         client = self._get_client()
         try:
-            config = types.EmbedContentConfig(task_type=task_type) if task_type else None
-            response = client.models.embed_content(model=self._embedding_model, contents=text, config=config)
+            embed_config = types.EmbedContentConfig(task_type=task_type) if task_type else None
+            response = _call_with_app_timeout(
+                config.ai_timeout_seconds,
+                client.models.embed_content,
+                model=self._embedding_model,
+                contents=text,
+                config=embed_config,
+            )
         except Exception as exc:  # noqa: BLE001
             logger.exception("Gemini embed_content call failed")
             raise AIProviderError(f"Gemini embedding request failed: {exc}") from exc
